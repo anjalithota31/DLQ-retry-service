@@ -1,0 +1,21 @@
+2026-07-31 15:19:47.561 [main] INFO  com.tyss.dlq.DlqRepairApplication - Starting DLQ Repair Service
+2026-07-31 15:19:47.580 [main] INFO  com.tyss.dlq.ConfigValidator - Validating configuration...
+2026-07-31 15:19:47.582 [main] INFO  com.tyss.dlq.ConfigValidator - Configuration validation passed
+2026-07-31 15:19:47.858 [main] INFO  com.tyss.dlq.HealthCheckServer - Health check server started on port 8080
+2026-07-31 15:19:48.343 [main] INFO  com.tyss.dlq.DlqRepairApplication - Elasticsearch authentication enabled for user 'elastic'.
+2026-07-31 15:19:48.810 [main] INFO  com.tyss.dlq.DlqRepairApplication - Elasticsearch client built. url=http://173.201.37.187:30224/, auth=true, sslVerify=true
+2026-07-31 15:19:48.898 [main] INFO  com.tyss.dlq.MappingCache - MappingCache initialized with maxSize=100, ttlMinutes=5
+2026-07-31 15:19:48.900 [main] INFO  com.tyss.dlq.DlqRepairApplication - Mapping cache initialized with size=100, ttl=5 minutes
+2026-07-31 15:19:49.601 [main] WARN  org.apache.kafka.clients.consumer.ConsumerConfig - These configurations '[metadata.fetch.timeout.ms]' were supplied but are not used yet.
+2026-07-31 15:19:51.520 [main] WARN  org.apache.kafka.clients.NetworkClient - [Consumer clientId=consumer-dlq-repair-service-1, groupId=dlq-repair-service] Connection to node 1 (localhost/127.0.0.1:9094) could not be established. Broker may not be available.
+2026-07-31 15:19:51.624 [main] WARN  org.apache.kafka.clients.NetworkClient - [Consumer clientId=consumer-dlq-repair-service-1, groupId=dlq-repair-service] Connection to node 1 (localhost/127.0.0.1:9094) could not be established. Broker may not be available.
+2026-07-31 15:19:51.730 [main] WARN  org.apache.kafka.clients.NetworkClient - [Consumer clientId=consumer-dlq-repair-service-1, groupId=dlq-repair-service] Connection to node 1 (localhost/127.0.0.1:9094) could not be established. Broker may not be available.
+2026-07-31 15:19:51.937 [main] WARN  org.apache.kafka.clients.NetworkClient - [Consumer clientId=consumer-dlq-repair-service-1, groupId=dlq-repair-service] Connection to node 1 (localhost/127.0.0.1:9094) could not be established. Broker may not be available.
+2026-07-31 15:19:52.344 [main] WARN  org.apache.kafka.clients.NetworkClient - [Consumer clientId=consumer-dlq-repair-service-1, groupId=dlq-repair-service] Connection to node 1 (localhost/127.0.0.1:9094) could not be established. Broker may not be available.
+2026-07-31 15:19:53.057 [main] WARN  org.apache.kafka.clients.NetworkClient - [Consumer clientId=consumer-dlq-repair-service-1, groupId=dlq-repair-service] Connection to node 1 (localhost/127.0.0.1:9094) could not be established. Broker may not be available.
+2026-07-31 15:19:54.076 [main] WARN  org.apache.kafka.clients.NetworkClient - [Consumer clientId=consumer-dlq-repair-service-1, groupId=dlq-repair-service] Connection to node 1 (localhost/127.0.0.1:9094) could not be established. Broker may not be available.
+2026-07-31 15:19:55.294 [main] WARN  org.apache.kafka.clients.NetworkClient - [Consumer clientId=consumer-dlq-repair-service-1, groupId=dlq-repair-service] Connection to node 1 (localhost/127.0.0.1:9094) could not be established. Broker may not be available.
+2026-07-31 15:19:56.309 [main] WARN  org.apache.kafka.clients.NetworkClient - [Consumer clientId=consumer-dlq-repair-service-1, groupId=dlq-repair-service] Connection to node 1 (localhost/127.0.0.1:9094) could not be established. Broker may not be available.
+2026-07-31 15:19:57.428 [main] WARN  org.apache.kafka.clients.NetworkClient - [Consumer clientId=consumer-dlq-repair-service-1, groupId=dlq-repair-service] Connection to node 1 (localhost/127.0.0.1:9094) could not be established. Broker may not be available.
+2026-07-31 15:19:58.339 [main] WARN  org.apache.kafka.clients.NetworkClient - [Consumer clientId=consumer-dlq-repair-service-1, groupId=dlq-repair-service] Connection to node 1 (localhost/127.0.0.1:9094) could not be established. Broker may not be available.
+2026-07-31 15:19:59.560 [main] WARN  org.apache.kafka.clients.NetworkClient - [Consumer clientId=consumer-dlq-repair-service-1, groupId=dlq-repair-service] Connection to node 1 (localhost/127.0.0.1:9094) could not be established. Broker may not be available.

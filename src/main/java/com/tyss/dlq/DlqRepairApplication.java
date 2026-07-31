@@ -527,9 +527,9 @@ consumer.seekToBeginning(consumer.assignment());
             }
         }
         
-        // Fallback: derive from topic name
+        // Fallback: derive from topic name by removing dlq_ prefix
         String topic = record.topic();
-        String index = topic.replace("-dlq", "").toLowerCase();
+        String index = topic.replaceFirst("^dlq_", "").toLowerCase();
         log.debug("Derived target index from topic '{}': {}", topic, index);
         return index;
     }
