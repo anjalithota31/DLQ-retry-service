@@ -49,7 +49,12 @@ public class DocumentRepairer {
             Object fieldValue = entry.getValue();
 
             if (!indexMapping.containsKey(fieldName)) {
-                continue; // not in mapping — pass through, ES dynamic mapping handles it
+                // Field not in mapping - treat as unconvertible
+                repairedDoc.remove(fieldName);
+                unconvertibleFields.put(fieldName, new RepairResult.UnconvertibleField(
+                        toRawString(fieldValue), "unknown", "Field not in ES mapping"));
+                log.warn("Field '{}' not in mapping - marked as unconvertible", fieldName);
+                continue;
             }
 
             Map<String, Object> fieldMapping = (Map<String, Object>) indexMapping.get(fieldName);
@@ -128,7 +133,12 @@ public class DocumentRepairer {
                     String nestedFullPath = fullPath + "." + nestedFieldName;
 
                     if (!nestedProperties.containsKey(nestedFieldName)) {
-                        continue; // Nested field not in mapping, skip
+                        // Nested field not in mapping - treat as unconvertible
+                        fieldValueMap.remove(nestedFieldName);
+                        unconvertibleFields.put(nestedFullPath, new RepairResult.UnconvertibleField(
+                                toRawString(nestedFieldValue), "unknown", "Field not in ES mapping"));
+                        log.warn("Nested field '{}' not in mapping - marked as unconvertible", nestedFullPath);
+                        continue;
                     }
 
                     Map<String, Object> nestedFieldMapping = (Map<String, Object>) nestedProperties.get(nestedFieldName);
