@@ -209,8 +209,10 @@ public class DocumentRepairer {
                 case "boolean":   return repairBoolean(value);
                 case "keyword":
                 case "text":      return repairText(value, esType);
+                case "object":
+                case "nested":    return repairObject(fieldName, value, esType);
                 default:
-                    // object, nested, geo_point, etc. — pass through
+                    // geo_point, ip, etc. — pass through
                     return RepairOutcome.valid();
             }
         } catch (Exception e) {
@@ -325,5 +327,12 @@ public class DocumentRepairer {
         } catch (Exception e) {
             return RepairOutcome.unconvertible("Cannot serialize to " + esType + ": " + e.getMessage());
         }
+    }
+
+    private RepairOutcome repairObject(String fieldName, Object value, String esType) {
+        if (value == null) return RepairOutcome.valid();
+        if (value instanceof Map) return RepairOutcome.valid();
+        // Concrete value (string, number, etc.) where object is expected
+        return RepairOutcome.unconvertible("Expected object for field '" + fieldName + "' but found " + value.getClass().getSimpleName() + " value: " + value);
     }
 }
