@@ -18,7 +18,7 @@ import co.elastic.clients.elasticsearch.ElasticsearchClient;
 import co.elastic.clients.json.jackson.JacksonJsonpMapper;
 import co.elastic.clients.transport.ElasticsearchTransport;
 import co.elastic.clients.transport.rest_client.RestClientTransport;
-import org.elasticsearch.client.RequestOptions;
+
 import org.elasticsearch.client.RestClient;
 import org.elasticsearch.client.RestClientBuilder;
 import org.slf4j.Logger;
@@ -521,7 +521,7 @@ consumer.seekToBeginning(consumer.assignment());
         Headers headers = record.headers();
         for (Header header : headers) {
             if (header.key().equals("X-Target-Index")) {
-                String index = new String(header.value(), StandardCharsets.UTF_8);
+                String index = new String(header.value(), StandardCharsets.UTF_8).toLowerCase();
                 log.debug("Extracted target index from header: {}", index);
                 return index;
             }
@@ -529,7 +529,7 @@ consumer.seekToBeginning(consumer.assignment());
         
         // Fallback: derive from topic name
         String topic = record.topic();
-        String index = topic.replace("-dlq", "");
+        String index = topic.replace("-dlq", "").toLowerCase();
         log.debug("Derived target index from topic '{}': {}", topic, index);
         return index;
     }
