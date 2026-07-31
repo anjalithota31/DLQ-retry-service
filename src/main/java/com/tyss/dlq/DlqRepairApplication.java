@@ -1,0 +1,882 @@
+package com.tyss.dlq;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.http.HttpHost;
+import org.apache.http.auth.AuthScope;
+import org.apache.http.auth.UsernamePasswordCredentials;
+import org.apache.http.conn.ssl.NoopHostnameVerifier;
+import org.apache.http.conn.ssl.TrustAllStrategy;
+import org.apache.http.impl.client.BasicCredentialsProvider;
+import org.apache.http.ssl.SSLContextBuilder;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.header.Headers;
+import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.json.jackson.JacksonJsonpMapper;
+import co.elastic.clients.transport.ElasticsearchTransport;
+import co.elastic.clients.transport.rest_client.RestClientTransport;
+import org.elasticsearch.client.RequestOptions;
+import org.elasticsearch.client.RestClient;
+import org.elasticsearch.client.RestClientBuilder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+/**
+ * DLQ Repair Service.
+ *
+ * Flow per poll batch:
+ *   1. Repair all records in-memory against the ES mapping
+ *   2. Bulk index repaired docs → target index         (1 ES call)
+ *   3. Bulk index raw fallback docs → raw index        (1 ES call, only if unconvertible fields exist)
+ *   4. Any doc that still fails ES indexing → stored in dlq-failed-documents index for manual review
+ *   5. commitAsync()
+ *
+ * No retry topic — schema failures are deterministic and won't self-heal on retry.
+ * Transient ES failures are handled by the bulk retry built into the ES client.
+ */
+public class DlqRepairApplication {
+
+    private static final Logger log = LoggerFactory.getLogger(DlqRepairApplication.class);
+
+    public static void main(String[] args) throws Exception {
+        log.info("Starting DLQ Repair Service");
+
+        Properties appConfig = loadConfig();
+        System.out.println("max.retries = " + appConfig.getProperty("max.retries"));
+        // Validate configuration before starting
+        try {
+            ConfigValidator.validate(appConfig);
+        } catch (IllegalArgumentException e) {
+            log.error("Configuration validation failed: {}", e.getMessage());
+            System.exit(1);
+        }
+
+        // Helper method to get config from env var or properties file
+        java.util.function.Function<String, String> getConfig = (key) -> {
+            // Convert property key to env var name (e.g., kafka.bootstrap.servers -> KAFKA_BOOTSTRAP_SERVERS)
+            String envVarName = key.toUpperCase().replace('.', '_');
+            String envValue = System.getenv(envVarName);
+            if (envValue != null && !envValue.isEmpty()) {
+                return envValue;
+            }
+            return appConfig.getProperty(key);
+        };
+
+        String dlqTopicPattern  = getConfig.apply("dlq.topic.pattern");
+        String dlqTopic         = getConfig.apply("dlq.topic");
+        String failedIndex      = getConfig.apply("failed.docs.index");
+        final String finalFailedIndex = (failedIndex == null) ? "dlq-failed-documents" : failedIndex;
+        String esUrl            = getConfig.apply("elasticsearch.url");
+        final String finalEsUrl = (esUrl == null) ? "http://localhost:9200" : esUrl;
+        String targetIndex      = getConfig.apply("target.index");
+        
+        // Mapping cache configuration
+        int mappingCacheSize = Integer.parseInt(
+                getConfig.apply("mapping.cache.size"));
+        if (mappingCacheSize == 0) mappingCacheSize = 100;
+        long mappingCacheTtlMinutes = Long.parseLong(
+                getConfig.apply("mapping.cache.ttl.minutes"));
+        if (mappingCacheTtlMinutes == 0) mappingCacheTtlMinutes = 5;
+        
+        // Thread pool configuration
+        int threadPoolSize = Integer.parseInt(
+                getConfig.apply("thread.pool.size"));
+        if (threadPoolSize == 0) threadPoolSize = 10;
+        int threadPoolQueueSize = Integer.parseInt(
+                getConfig.apply("thread.pool.queue.size"));
+        if (threadPoolQueueSize == 0) threadPoolQueueSize = 1000;
+        
+        // Retry configuration
+        int maxRetries = Integer.parseInt(getConfig.apply("max.retries"));
+        if (maxRetries == 0) maxRetries = 3;
+        long retryBackoffMs = Long.parseLong(getConfig.apply("retry.backoff.ms"));
+        if (retryBackoffMs == 0) retryBackoffMs = 100;
+        
+        // Circuit breaker configuration
+        int circuitBreakerThreshold = Integer.parseInt(
+                getConfig.apply("circuit.breaker.failure.threshold"));
+        if (circuitBreakerThreshold == 0) circuitBreakerThreshold = 5;
+        long circuitBreakerTimeoutMs = Long.parseLong(
+                getConfig.apply("circuit.breaker.timeout.ms"));
+        if (circuitBreakerTimeoutMs == 0) circuitBreakerTimeoutMs = 60000;
+        
+        // Health check configuration
+        int healthCheckPort = Integer.parseInt(getConfig.apply("health.check.port"));
+        if (healthCheckPort == 0) healthCheckPort = 8080;
+        HealthCheckServer healthCheckServer = new HealthCheckServer(healthCheckPort);
+        
+        // Rate limiter configuration (optional, 0 means disabled)
+        double maxRecordsPerSecond = Double.parseDouble(
+                getConfig.apply("rate.limit.records.per.second"));
+        if (maxRecordsPerSecond == 0) maxRecordsPerSecond = 0;
+        RateLimiter rateLimiter = maxRecordsPerSecond > 0 ? new RateLimiter(maxRecordsPerSecond) : null;
+        
+        try {
+            healthCheckServer.start();
+        } catch (IOException e) {
+            log.warn("Failed to start health check server on port {}", healthCheckPort, e);
+        }
+
+        // Credentials: prefer environment variables, fall back to properties file
+        String esUser = System.getenv("ES_USERNAME");
+        if (esUser == null) esUser = getConfig.apply("elasticsearch.username");
+        if (esUser == null) esUser = "";
+        String esPass = System.getenv("ES_PASSWORD");
+        if (esPass == null) esPass = getConfig.apply("elasticsearch.password");
+        if (esPass == null) esPass = "";
+        boolean sslVerify = Boolean.parseBoolean(
+                getConfig.apply("elasticsearch.ssl.verify"));
+        if (getConfig.apply("elasticsearch.ssl.verify") == null) sslVerify = true;
+
+        ElasticsearchClient esClient = buildEsClient(finalEsUrl, esUser, esPass, sslVerify);
+        log.info("Elasticsearch client built. url={}, auth={}, sslVerify={}",
+                finalEsUrl, !esUser.isEmpty(), sslVerify);
+
+        ObjectMapper mapper = new ObjectMapper();
+
+        // Initialize mapping cache for dynamic multi-index support
+        MappingCache mappingCache = new MappingCache(esClient, mappingCacheSize, mappingCacheTtlMinutes);
+        log.info("Mapping cache initialized with size={}, ttl={} minutes", mappingCacheSize, mappingCacheTtlMinutes);
+        
+        // In multi-topic mode, mappings are loaded dynamically per index from headers
+        // No initial mapping needed - will be loaded per target index during processing
+
+        // Create circuit breaker and indexer with retry configuration
+        CircuitBreaker circuitBreaker = new CircuitBreaker(circuitBreakerThreshold, circuitBreakerTimeoutMs);
+        ElasticsearchIndexer indexer = new ElasticsearchIndexer(esClient, mapper, maxRetries, retryBackoffMs, circuitBreaker);
+        
+        // Create metrics collector
+        MetricsCollector metrics = new MetricsCollector();
+        
+        // Update health check with circuit breaker status
+        healthCheckServer.setHealthMessage("Service initialized, circuit breaker: " + circuitBreaker.getState());
+
+        KafkaConsumer<String, String> consumer = buildConsumer(appConfig);
+
+        System.out.println("====================================");
+        System.out.println("Consumer created");
+        System.out.println("Bootstrap Servers : " + getConfig.apply("kafka.bootstrap.servers"));
+        System.out.println("Group Id          : " + getConfig.apply("kafka.consumer.group.id"));
+        System.out.println("DLQ Topic         : " + dlqTopic);
+        System.out.println("DLQ Pattern       : " + dlqTopicPattern);
+        System.out.println("====================================");
+
+        // Subscribe to topics
+        if (dlqTopicPattern != null && !dlqTopicPattern.isEmpty()) {
+            List<String> matchedTopics = discoverDlqTopics(consumer, dlqTopicPattern);
+            if (!matchedTopics.isEmpty()) {
+                // Check topic metadata before subscribing
+                List<String> validTopics = new ArrayList<>();
+                for (String topic : matchedTopics) {
+                    try {
+                        var partitions = consumer.partitionsFor(topic);
+                        System.out.println("Topic '" + topic + "' has " + partitions.size() + " partitions");
+                        if (partitions.isEmpty()) {
+                            System.out.println("WARNING: Topic '" + topic + "' has 0 partitions!");
+                        } else {
+                            validTopics.add(topic);
+                        }
+                    } catch (Exception e) {
+                        System.out.println("Error getting partitions for topic '" + topic + "': " + e.getMessage());
+                        System.out.println("Skipping this topic due to metadata fetch failure");
+                    }
+                }
+                
+                if (!validTopics.isEmpty()) {
+                    consumer.subscribe(validTopics);
+                    log.info("Subscribed to topics: {}", validTopics);
+                } else {
+                    System.out.println("All pattern-matched topics failed metadata fetch");
+                    System.out.println("Fallback topic configured: " + dlqTopic);
+                    try {
+                        System.out.println("Available topics: " + consumer.listTopics().keySet());
+                    } catch (Exception e) {
+                        System.out.println("Error listing topics: " + e.getMessage());
+                    }
+                    if (dlqTopic != null && !dlqTopic.isEmpty()) {
+                        System.out.println("Subscribing to fallback topic: " + dlqTopic);
+                        consumer.subscribe(Collections.singletonList(dlqTopic));
+                        log.info("Subscribed to fallback topic: {}", dlqTopic);
+                        
+                        try {
+                            var partitions = consumer.partitionsFor(dlqTopic);
+                            System.out.println("Fallback topic '" + dlqTopic + "' has " + partitions.size() + " partitions");
+                        } catch (Exception e) {
+                            System.out.println("Error getting partitions for fallback topic '" + dlqTopic + "': " + e.getMessage());
+                        }
+                    } else {
+                        throw new IllegalStateException("All pattern-matched topics failed metadata fetch and no fallback topic configured");
+                    }
+                }
+            } else {
+                System.out.println("No topics matched pattern: " + dlqTopicPattern);
+                System.out.println("Available topics: " + consumer.listTopics().keySet());
+                if (dlqTopic != null && !dlqTopic.isEmpty()) {
+                    System.out.println("Subscribing to fallback topic: " + dlqTopic);
+                    consumer.subscribe(Collections.singletonList(dlqTopic));
+                    log.info("Subscribed to fallback topic: {}", dlqTopic);
+                    
+                    try {
+                        var partitions = consumer.partitionsFor(dlqTopic);
+                        System.out.println("Fallback topic '" + dlqTopic + "' has " + partitions.size() + " partitions");
+                    } catch (Exception e) {
+                        System.out.println("Error getting partitions for fallback topic '" + dlqTopic + "': " + e.getMessage());
+                    }
+                } else {
+                    throw new IllegalStateException("No topics matched pattern and no fallback topic configured");
+                }
+            }
+        } else if (dlqTopic != null && !dlqTopic.isEmpty()) {
+            System.out.println("Subscribing to topic: " + dlqTopic);
+            consumer.subscribe(Collections.singletonList(dlqTopic));
+            log.info("Subscribed to topic: {}", dlqTopic);
+            
+            try {
+                var partitions = consumer.partitionsFor(dlqTopic);
+                System.out.println("Topic '" + dlqTopic + "' has " + partitions.size() + " partitions");
+            } catch (Exception e) {
+                System.out.println("Error getting partitions for topic '" + dlqTopic + "': " + e.getMessage());
+            }
+        } else {
+            throw new IllegalStateException("Neither dlq.topic.pattern nor dlq.topic is configured");
+        }
+
+// Wait until Kafka assigns partitions
+        int attempts = 0;
+
+        while (consumer.assignment().isEmpty()) {
+
+            ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+
+            System.out.println("------------------------------------");
+            System.out.println("Poll Attempt : " + (++attempts));
+            System.out.println("Subscription : " + consumer.subscription());
+            System.out.println("Assignment   : " + consumer.assignment());
+            System.out.println("Records      : " + records.count());
+            System.out.println("------------------------------------");
+
+            if (attempts >= 200) {
+                System.out.println("No partition assignment after 200 polls.");
+                System.out.println("Please check Kafka broker and consumer group coordinator status.");
+                System.out.println("Group ID: " + appConfig.getProperty("kafka.consumer.group.id"));
+                System.out.println("Bootstrap Servers: " + appConfig.getProperty("kafka.bootstrap.servers"));
+                throw new IllegalStateException("Kafka consumer group coordinator not assigning partitions");
+            }
+        }
+        System.out.println("Final Assignment : " + consumer.assignment());
+        log.info("Assigned partitions: {}", consumer.assignment());
+
+// Force consumer to start from beginning to reprocess all DLQ messages
+consumer.seekToBeginning(consumer.assignment());
+
+        // Initialize thread pool for concurrent processing
+        ExecutorService threadPool = new ThreadPoolExecutor(
+                threadPoolSize,
+                threadPoolSize,
+                60L, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(threadPoolQueueSize),
+                new ThreadPoolExecutor.CallerRunsPolicy());
+        log.info("Thread pool initialized with size={}, queueSize={}", threadPoolSize, threadPoolQueueSize);
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            log.info("Shutdown signal received. Flushing and closing.");
+            log.info("Final metrics: {}", metrics.getMetricsSummary());
+            log.info("Final mapping cache stats: {}", mappingCache.getStats());
+            healthCheckServer.setHealthy(false);
+            healthCheckServer.setHealthMessage("Shutting down");
+            try { consumer.commitSync(); } catch (Exception ignored) {}
+            consumer.close();
+            threadPool.shutdown();
+            try {
+                esClient.close();
+            } catch (IOException e) {
+                log.warn("Error closing ES client", e);
+            }
+            healthCheckServer.stop();
+        }));
+
+        while (true) {
+
+            // ----------------------------------------------------------------
+            // Periodic health check update
+            // ----------------------------------------------------------------
+            healthCheckServer.setHealthy(circuitBreaker.getState() != CircuitBreaker.State.OPEN);
+            healthCheckServer.setHealthMessage(String.format("Operating normally. Circuit breaker: %s, Failures: %d. Cache: %s. %s", 
+                    circuitBreaker.getState(), circuitBreaker.getFailureCount(), mappingCache.getStats(), metrics.getMetricsSummary()));
+
+            // ----------------------------------------------------------------
+            // Poll
+            // ----------------------------------------------------------------
+            ConsumerRecords<String, String> records = consumer.poll(Duration.ofSeconds(2));
+            log.info("Polled {} records", records.count());
+            if (records.isEmpty()) {
+                log.info("No records available");
+                continue;
+            }
+
+            log.info("Polled {} records from DLQ topic.", records.count());
+            
+            // Apply rate limiting if configured
+            if (rateLimiter != null) {
+                try {
+                    rateLimiter.acquire(records.count());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    log.warn("Rate limiting interrupted", e);
+                    break;
+                }
+            }
+            
+            long batchStartTime = System.currentTimeMillis();
+            metrics.incrementRecordsProcessed();
+
+            // ----------------------------------------------------------------
+            // Phase 1: Group records by target index for efficient bulk operations
+            // ----------------------------------------------------------------
+
+            // Group records by target index for efficient bulk operations
+            Map<String, List<ConsumerRecord<String, String>>> recordsByIndex = new HashMap<>();
+            for (ConsumerRecord<String, String> record : records) {
+                String recordTargetIndex = extractTargetIndex(record);
+                recordsByIndex.computeIfAbsent(recordTargetIndex, k -> new ArrayList<>()).add(record);
+            }
+            
+            log.info("Processing {} records across {} target indices", records.count(), recordsByIndex.size());
+            
+            // Process each index group concurrently
+            List<Future<Void>> futures = new ArrayList<>();
+            for (Map.Entry<String, List<ConsumerRecord<String, String>>> entry : recordsByIndex.entrySet()) {
+                String indexTarget = entry.getKey();
+                List<ConsumerRecord<String, String>> indexRecords = entry.getValue();
+                
+                futures.add(threadPool.submit(() -> {
+                    try {
+                        processIndexBatch(indexTarget, indexRecords, mapper, mappingCache, 
+                                indexer, finalFailedIndex, metrics);
+                    } catch (Exception e) {
+                        log.error("Error processing batch for index '{}'", indexTarget, e);
+                        throw new RuntimeException(e);
+                    }
+                    return null;
+                }));
+            }
+            
+            // Wait for all batches to complete
+            for (Future<Void> future : futures) {
+                try {
+                    future.get(5, TimeUnit.MINUTES);
+                } catch (TimeoutException e) {
+                    log.error("Timeout waiting for batch processing");
+                } catch (Exception e) {
+                    log.error("Error in batch processing", e);
+                }
+            }
+
+            // ----------------------------------------------------------------
+            // Phase 5: Commit offsets
+            // ----------------------------------------------------------------
+            consumer.commitAsync((offsets, exception) -> {
+                if (exception != null) {
+                    log.warn("Async offset commit failed. Will retry on next poll.", exception);
+                }
+            });
+            
+            // Record batch processing time
+            long processingTime = System.currentTimeMillis() - batchStartTime;
+            metrics.recordProcessingTime(processingTime);
+            log.debug("Batch processing completed in {}ms", processingTime);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Failed-doc storage helpers
+    // -------------------------------------------------------------------------
+
+    /** Called when the document was repaired but ES still rejected it. */
+    private static void storeIndexFailure(ConsumerRecord<String, String> record,
+                                           ElasticsearchIndexer indexer,
+                                           String failedIndex,
+                                           String targetIndex,
+                                           ObjectMapper mapper) {
+        try {
+            String esId = toEsId(record.key());
+            FailedDocument failedDoc = new FailedDocument(
+                    targetIndex,
+                    esId,
+                    "ES rejected document after repair",
+                    "ES rejected document after repair");
+            indexer.index(failedIndex, esId, mapper.convertValue(failedDoc, Map.class));
+        } catch (Exception e) {
+            log.error("Could not store index-failure doc. id={}. Record may be lost.", toEsId(record.key()), e);
+        }
+    }
+
+    /** Called when the record could not be parsed or repaired at all. */
+    private static void storeParseFailure(ConsumerRecord<String, String> record,
+                                           Exception cause,
+                                           ElasticsearchIndexer indexer,
+                                           String failedIndex,
+                                           String targetIndex,
+                                           ObjectMapper mapper) {
+        try {
+            String esId = toEsId(record.key());
+            FailedDocument failedDoc = new FailedDocument(
+                    targetIndex,
+                    esId,
+                    "Parse/repair error: " + cause.getMessage(),
+                    "Parse/repair error: " + cause.getMessage());
+            indexer.index(failedIndex, esId, mapper.convertValue(failedDoc, Map.class));
+        } catch (Exception e) {
+            log.error("Could not store parse-failure doc. id={}. Record may be lost.", toEsId(record.key()), e);
+        }
+    }
+
+    /** Called when document has unconvertible fields. Returns cleaned doc and failure info for bulk storage. */
+    private static UnconvertibleFieldResult handleUnconvertibleFields(ConsumerRecord<String, String> record,
+                                                                     RepairResult repairResult,
+                                                                     String targetIndex,
+                                                                     ObjectMapper mapper) {
+        String esId = toEsId(record.key());
+        
+        // Build map of unconvertible field names with their reasons
+        Map<String, String> problematicFieldsWithReasons = new LinkedHashMap<>();
+        repairResult.getUnconvertibleFields().forEach((fieldName, unconvertibleField) -> 
+            problematicFieldsWithReasons.put(fieldName, unconvertibleField.getReason()));
+        
+        // Build list of unconvertible field names for the failure reason
+        StringBuilder reason = new StringBuilder("Unconvertible fields: ");
+        problematicFieldsWithReasons.keySet().forEach(field -> 
+            reason.append(field).append(", "));
+        if (reason.length() > 2) {
+            reason.setLength(reason.length() - 2); // Remove trailing comma
+        }
+        
+        // Create failure document for bulk storage with problematic fields and reasons
+        FailedDocument failedDoc = new FailedDocument(targetIndex, esId, reason.toString(), 
+                problematicFieldsWithReasons);
+        
+        // Return the document WITHOUT unconvertible fields for indexing to target
+        Map<String, Object> cleanedDoc = new LinkedHashMap<>(repairResult.getDocument());
+        problematicFieldsWithReasons.keySet().forEach(cleanedDoc::remove);
+        
+        return new UnconvertibleFieldResult(cleanedDoc, failedDoc, esId);
+    }
+
+    /** Helper class to hold unconvertible field processing results. */
+    private static class UnconvertibleFieldResult {
+        final Map<String, Object> cleanedDocument;
+        final FailedDocument failureDocument;
+        final String documentId;
+        
+        UnconvertibleFieldResult(Map<String, Object> cleanedDocument, FailedDocument failureDocument, String documentId) {
+            this.cleanedDocument = cleanedDocument;
+            this.failureDocument = failureDocument;
+            this.documentId = documentId;
+        }
+    }
+
+    /**
+     * Safely converts a Kafka record key to a valid Elasticsearch document ID.
+     * Handles null keys, Struct objects, and other non-string types.
+     */
+    private static String toEsId(Object key) {
+        if (key == null) {
+            return java.util.UUID.randomUUID().toString();
+        }
+        if (key instanceof String) {
+            String strKey = (String) key;
+            return strKey.isEmpty() ? java.util.UUID.randomUUID().toString() : strKey;
+        }
+        // For non-string keys (e.g., Kafka Connect Struct), convert to JSON string
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            String jsonKey = mapper.writeValueAsString(key);
+            // Remove special characters that are invalid in ES IDs
+            return jsonKey.replaceAll("[^a-zA-Z0-9_-]", "_");
+        } catch (Exception e) {
+            // Fallback to toString() with sanitization
+            String strKey = key.toString().replaceAll("[^a-zA-Z0-9_-]", "_");
+            return strKey.isEmpty() ? java.util.UUID.randomUUID().toString() : strKey;
+        }
+    }
+
+    /**
+     * Extracts the target index from the record headers or derives it from the topic name.
+     */
+    private static String extractTargetIndex(ConsumerRecord<String, String> record) {
+        // First, try to extract from headers
+        Headers headers = record.headers();
+        for (Header header : headers) {
+            if (header.key().equals("X-Target-Index")) {
+                String index = new String(header.value(), StandardCharsets.UTF_8);
+                log.debug("Extracted target index from header: {}", index);
+                return index;
+            }
+        }
+        
+        // Fallback: derive from topic name
+        String topic = record.topic();
+        String index = topic.replace("-dlq", "");
+        log.debug("Derived target index from topic '{}': {}", topic, index);
+        return index;
+    }
+    
+    /**
+     * Processes a batch of records for a specific target index.
+     */
+    private static void processIndexBatch(String targetIndex,
+                                          List<ConsumerRecord<String, String>> records,
+                                          ObjectMapper mapper,
+                                          MappingCache mappingCache,
+                                          ElasticsearchIndexer indexer,
+                                          String failedIndex,
+                                          MetricsCollector metrics) {
+        
+        // Get mapping for this index
+        Map<String, Object> mapping = mappingCache.getMapping(targetIndex);
+        DocumentRepairer indexRepairer = new DocumentRepairer(mapping, mapper);
+        
+        List<ElasticsearchIndexer.BulkEntry> targetBatch = new ArrayList<>();
+        List<ElasticsearchIndexer.FailureEntry> failureBatch = new ArrayList<>();
+        Map<String, PendingRecord> pendingById = new LinkedHashMap<>();
+        
+        // Phase 1: Repair all records in-memory
+        for (ConsumerRecord<String, String> record : records) {
+            try {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> originalDoc = mapper.readValue(record.value(), Map.class);
+
+                RepairResult result = indexRepairer.repair(originalDoc);
+
+                String esId = toEsId(record.key());
+                log.debug("Repaired record. id={}, repaired={}, removed={}, unconvertible={}",
+                        esId,
+                        result.getRepairedFields().size(),
+                        result.getRemovedFields().size(),
+                        result.getUnconvertibleFields().size());
+
+                if (!result.getRepairedFields().isEmpty()) {
+                    metrics.incrementRecordsRepaired();
+                }
+                
+                if (!result.getUnconvertibleFields().isEmpty()) {
+                    metrics.incrementRecordsWithUnconvertibleFields();
+                }
+
+                // If document has unconvertible fields, collect failure info and use cleaned doc for target index
+                Map<String, Object> docForTargetIndex = result.getDocument();
+                if (!result.getUnconvertibleFields().isEmpty()) {
+                    UnconvertibleFieldResult unconvertibleResult = handleUnconvertibleFields(record, result, targetIndex, mapper);
+                    docForTargetIndex = unconvertibleResult.cleanedDocument;
+                    failureBatch.add(new ElasticsearchIndexer.FailureEntry(
+                            unconvertibleResult.documentId,
+                            mapper.convertValue(unconvertibleResult.failureDocument, Map.class)));
+                }
+
+                targetBatch.add(new ElasticsearchIndexer.BulkEntry(esId, docForTargetIndex));
+                pendingById.put(esId, new PendingRecord(record, result));
+
+            } catch (Exception e) {
+                // Malformed JSON or unexpected repair crash — store directly in failed-docs
+                log.error("Failed to parse/repair DLQ record. offset={}. Storing in failed-docs index.",
+                        record.offset(), e);
+                storeParseFailure(record, e, indexer, failedIndex, targetIndex, mapper);
+            }
+        }
+        
+        // Phase 2: Bulk index repaired docs → target index
+        Map<String, String> failedIdsWithReasons = indexer.bulkIndex(targetIndex, targetBatch);
+        Set<String> failedSet = new HashSet<>(failedIdsWithReasons.keySet());
+
+        metrics.incrementEsBulkOperations();
+        metrics.incrementRecordsSucceeded(targetBatch.size() - failedSet.size());
+        metrics.incrementRecordsFailed(failedSet.size());
+
+        log.info("Bulk index complete for index '{}'. total={}, succeeded={}, failed={}",
+                targetIndex, targetBatch.size(), targetBatch.size() - failedSet.size(), failedSet.size());
+
+        // Phase 3: Bulk index successful documents to dlq-failed-documents index for tracking
+        List<ElasticsearchIndexer.FailureEntry> successBatch = new ArrayList<>();
+        for (ElasticsearchIndexer.BulkEntry entry : targetBatch) {
+            if (!failedSet.contains(entry.id)) {
+                SuccessfulDocument successDoc = new SuccessfulDocument(targetIndex, entry.id);
+                successBatch.add(new ElasticsearchIndexer.FailureEntry(
+                        entry.id, mapper.convertValue(successDoc, Map.class)));
+            }
+        }
+        
+        if (!successBatch.isEmpty()) {
+            indexer.bulkIndexFailures(failedIndex, successBatch);
+            log.info("Bulk indexed {} successful documents to '{}' for tracking", successBatch.size(), failedIndex);
+        }
+
+        // Phase 4: Bulk index unconvertible field failures to failed-docs index
+        if (!failureBatch.isEmpty()) {
+            indexer.bulkIndexFailures(failedIndex, failureBatch);
+            log.info("Bulk indexed {} unconvertible field failures to '{}'", failureBatch.size(), failedIndex);
+        }
+
+        // Phase 5: Store permanently failed docs in dlq-failed-documents with actual ES error details
+        List<ElasticsearchIndexer.FailureEntry> permanentFailures = new ArrayList<>();
+        for (String failedId : failedIdsWithReasons.keySet()) {
+            PendingRecord pending = pendingById.get(failedId);
+            if (pending == null) continue;
+            String actualReason = failedIdsWithReasons.get(failedId);
+            log.error("ES indexing failed after repair. id={}, reason={}", failedId, actualReason);
+            FailedDocument failedDoc = new FailedDocument(targetIndex, failedId, actualReason, actualReason);
+            permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
+                    failedId, mapper.convertValue(failedDoc, Map.class)));
+        }
+        
+        if (!permanentFailures.isEmpty()) {
+            indexer.bulkIndexFailures(failedIndex, permanentFailures);
+            log.info("Bulk indexed {} permanent failures to '{}'", permanentFailures.size(), failedIndex);
+        }
+    }
+    
+    /**
+     * Discovers DLQ topics matching the given regex pattern.
+     */
+    private static List<String> discoverDlqTopics(KafkaConsumer<String, String> consumer, String pattern) {
+        try {
+            Pattern regex = Pattern.compile(pattern, Pattern.CASE_INSENSITIVE);;
+            return consumer.listTopics().keySet().stream()
+                    .filter(topic -> regex.matcher(topic).matches())
+                    .sorted()
+                    .collect(Collectors.toList());
+        } catch (Exception e) {
+            log.error("Failed to discover topics matching pattern '{}'", pattern, e);
+            return Collections.emptyList();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    private static class PendingRecord {
+        final ConsumerRecord<String, String> record;
+        final RepairResult                   repairResult;
+
+        PendingRecord(ConsumerRecord<String, String> record, RepairResult repairResult) {
+            this.record       = record;
+            this.repairResult = repairResult;
+        }
+    }
+
+    private static Properties loadConfig() throws IOException {
+        Properties props = new Properties();
+        try (InputStream is = DlqRepairApplication.class
+                .getClassLoader().getResourceAsStream("dlq-repair.properties")) {
+            if (is == null)
+                throw new IllegalStateException("dlq-repair.properties not found on classpath");
+            props.load(is);
+        }
+        
+        // Resolve ${VAR:default} placeholders
+        Properties resolvedProps = new Properties();
+        for (String key : props.stringPropertyNames()) {
+            String value = props.getProperty(key);
+            resolvedProps.setProperty(key, resolvePlaceholders(value));
+        }
+        return resolvedProps;
+    }
+    
+    private static String resolvePlaceholders(String value) {
+        if (value == null || !value.contains("${")) {
+            return value;
+        }
+        
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("\\$\\{([^:}]+):([^}]*)\\}");
+        java.util.regex.Matcher matcher = pattern.matcher(value);
+        StringBuffer result = new StringBuffer();
+        
+        while (matcher.find()) {
+            String envVar = matcher.group(1);
+            String defaultValue = matcher.group(2);
+            String envValue = System.getenv(envVar);
+            String resolvedValue = (envValue != null && !envValue.isEmpty()) ? envValue : defaultValue;
+            matcher.appendReplacement(result, java.util.regex.Matcher.quoteReplacement(resolvedValue));
+        }
+        matcher.appendTail(result);
+        
+        return result.toString();
+    }
+
+
+
+    private static ElasticsearchClient buildEsClient(String esUrl,
+                                                     String username,
+                                                     String password,
+                                                     boolean sslVerify) {
+
+        if (esUrl == null || esUrl.trim().isEmpty()) {
+            throw new IllegalArgumentException("Elasticsearch URL cannot be null or empty");
+        }
+
+        try {
+            URI uri = URI.create(esUrl.trim());
+
+            HttpHost httpHost = new HttpHost(
+                    uri.getHost(),
+                    uri.getPort(),
+                    uri.getScheme()
+            );
+
+            System.out.println("ES URL        : " + esUrl);
+            System.out.println("Parsed Host   : " + uri.getHost());
+            System.out.println("Parsed Port   : " + uri.getPort());
+            System.out.println("Parsed Scheme : " + uri.getScheme());
+
+            RestClientBuilder builder = RestClient.builder(httpHost);
+
+            boolean hasAuth = username != null && !username.isBlank();
+            boolean isHttps = "https".equalsIgnoreCase(uri.getScheme());
+
+            if (hasAuth || (isHttps && !sslVerify)) {
+                builder.setHttpClientConfigCallback(httpClientBuilder -> {
+
+                    if (hasAuth) {
+                        BasicCredentialsProvider credentialsProvider =
+                                new BasicCredentialsProvider();
+
+                        credentialsProvider.setCredentials(
+                                AuthScope.ANY,
+                                new UsernamePasswordCredentials(username, password)
+                        );
+
+                        httpClientBuilder.setDefaultCredentialsProvider(credentialsProvider);
+
+                        log.info("Elasticsearch authentication enabled for user '{}'.", username);
+                    }
+
+                    if (isHttps && !sslVerify) {
+                        try {
+                            httpClientBuilder
+                                    .setSSLContext(
+                                            new SSLContextBuilder()
+                                                    .loadTrustMaterial(null, TrustAllStrategy.INSTANCE)
+                                                    .build()
+                                    )
+                                    .setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE);
+
+                            log.warn("SSL certificate verification disabled.");
+                        } catch (Exception e) {
+                            throw new IllegalStateException("Failed to build SSL context", e);
+                        }
+                    }
+
+                    return httpClientBuilder;
+                });
+            }
+
+            // Create the low-level REST client
+            RestClient restClient = builder.build();
+
+            // Create the transport layer with Jackson JSON mapper
+            ElasticsearchTransport transport = new RestClientTransport(
+                    restClient,
+                    new JacksonJsonpMapper()
+            );
+
+            // Create the new Elasticsearch client
+            return new ElasticsearchClient(transport);
+
+        } catch (Exception e) {
+            throw new IllegalArgumentException(
+                    "Invalid Elasticsearch URL: " + esUrl, e);
+        }
+    }
+
+    private static KafkaConsumer<String, String> buildConsumer(Properties appConfig) {
+        Properties props = new Properties();
+        
+        // Helper to get config from env var or properties file
+        java.util.function.Function<String, String> getConfig = (key) -> {
+            String envVarName = key.toUpperCase().replace('.', '_');
+            String envValue = System.getenv(envVarName);
+            if (envValue != null && !envValue.isEmpty()) {
+                return envValue;
+            }
+            return appConfig.getProperty(key);
+        };
+        
+        // Prefer environment variables for sensitive Kafka config
+        String bootstrapServers = getConfig.apply("kafka.bootstrap.servers");
+        if (bootstrapServers == null) bootstrapServers = "localhost:9092";
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        
+        String groupId = getConfig.apply("kafka.consumer.group.id");
+        if (groupId == null) groupId = "dlq-repair-service";
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+        
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG,
+                "org.apache.kafka.common.serialization.StringDeserializer");
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG,
+                "org.apache.kafka.common.serialization.StringDeserializer");
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG,  "earliest");
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        
+        String maxPollRecords = getConfig.apply("consumer.max.poll.records");
+        if (maxPollRecords == null) maxPollRecords = "500";
+        props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, maxPollRecords);
+        
+        // Prevent rebalance if bulk ES indexing takes longer than default 5 min
+        String maxPollInterval = getConfig.apply("consumer.max.poll.interval.ms");
+        if (maxPollInterval == null) maxPollInterval = "600000";
+        props.put(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, maxPollInterval);
+        
+        // Session timeout - critical for partition assignment
+        String sessionTimeout = getConfig.apply("consumer.session.timeout.ms");
+        if (sessionTimeout == null) sessionTimeout = "30000";
+        props.put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, sessionTimeout);
+        
+        // Heartbeat interval - must be less than session timeout
+        String heartbeatInterval = getConfig.apply("consumer.heartbeat.interval.ms");
+        if (heartbeatInterval == null) heartbeatInterval = "10000";
+        props.put(ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG, heartbeatInterval);
+        
+        // Metadata request timeout - increase for slow networks
+        String metadataTimeout = getConfig.apply("consumer.metadata.timeout.ms");
+        if (metadataTimeout == null) metadataTimeout = "30000";
+        props.put("metadata.fetch.timeout.ms", metadataTimeout);
+        
+        // Request timeout for all requests
+        String requestTimeout = getConfig.apply("consumer.request.timeout.ms");
+        if (requestTimeout == null) requestTimeout = "40000";
+        props.put(ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG, requestTimeout);
+        
+        // Rebalance timeout - time for group rebalance
+        String rebalanceTimeout = getConfig.apply("consumer.rebalance.timeout.ms");
+        if (rebalanceTimeout == null) rebalanceTimeout = "60000";
+        props.put(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, maxPollInterval); // Keep original max poll interval
+        
+        // Fetch min bytes - minimum bytes to wait for in a fetch
+        String fetchMinBytes = getConfig.apply("consumer.fetch.min.bytes");
+        if (fetchMinBytes == null) fetchMinBytes = "1";
+        props.put(ConsumerConfig.FETCH_MIN_BYTES_CONFIG, fetchMinBytes);
+        
+        // Fetch max wait - max time to wait for fetch.min.bytes
+        String fetchMaxWait = getConfig.apply("consumer.fetch.max.wait.ms");
+        if (fetchMaxWait == null) fetchMaxWait = "500";
+        props.put(ConsumerConfig.FETCH_MAX_WAIT_MS_CONFIG, fetchMaxWait);
+        
+        System.out.println("Kafka Consumer Properties:");
+        props.forEach((k, v) -> System.out.println(k + " = " + v));
+        
+        return new KafkaConsumer<>(props);
+    }
+}
