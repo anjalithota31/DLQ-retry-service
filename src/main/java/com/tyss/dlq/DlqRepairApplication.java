@@ -351,10 +351,11 @@ consumer.seekToBeginning(consumer.assignment());
             Map<String, List<ConsumerRecord<String, String>>> recordsByIndex = new HashMap<>();
             for (ConsumerRecord<String, String> record : records) {
                 String recordTargetIndex = extractTargetIndex(record);
+                log.debug("Record from topic '{}' assigned to target index '{}'", record.topic(), recordTargetIndex);
                 recordsByIndex.computeIfAbsent(recordTargetIndex, k -> new ArrayList<>()).add(record);
             }
             
-            log.info("Processing {} records across {} target indices", records.count(), recordsByIndex.size());
+            log.info("Processing {} records across {} target indices: {}", records.count(), recordsByIndex.size(), recordsByIndex.keySet());
             
             // Process each index group concurrently
             List<Future<Void>> futures = new ArrayList<>();
@@ -527,9 +528,9 @@ consumer.seekToBeginning(consumer.assignment());
             }
         }
         
-        // Fallback: derive from topic name by removing dlq_ prefix
+        // Fallback: derive from topic name by removing dlq_ prefix (case-insensitive)
         String topic = record.topic();
-        String index = topic.replaceFirst("^dlq_", "").toLowerCase();
+        String index = topic.replaceFirst("(?i)^dlq_", "").toLowerCase();
         log.debug("Derived target index from topic '{}': {}", topic, index);
         return index;
     }

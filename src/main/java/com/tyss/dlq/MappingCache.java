@@ -66,17 +66,20 @@ public class MappingCache {
      */
     private Map<String, Object> loadMapping(String index) {
         try {
+            log.info("Attempting to load mapping for index: '{}'", index);
             GetMappingResponse response = esClient.indices()
                     .getMapping(m -> m.index(index));
 
             IndexMappingRecord mappingRecord = response.result().get(index);
             if (mappingRecord == null || mappingRecord.mappings() == null) {
-                log.warn("No mapping found for index '{}'. Repair will skip field validation.", index);
+                log.warn("No mapping found for index '{}'. The index may not exist. Repair will skip field validation.", index);
+                log.warn("Available indices in response: {}", response.result().keySet());
                 return Collections.emptyMap();
             }
 
             TypeMapping mapping = mappingRecord.mappings();
             if (mapping.properties() == null) {
+                log.warn("Mapping found for index '{}' but has no properties. Repair will skip field validation.", index);
                 return Collections.emptyMap();
             }
 
@@ -86,11 +89,11 @@ public class MappingCache {
                 properties.put(fieldName, convertPropertyToMap(property));
             });
 
-            log.info("Loaded ES mapping for index '{}': {} fields", index, properties.size());
+            log.info("Successfully loaded ES mapping for index '{}': {} fields", index, properties.size());
             return properties;
 
         } catch (Exception e) {
-            log.error("Failed to load mapping for index '{}'", index, e);
+            log.error("Failed to load mapping for index '{}'. Error: {}", index, e.getMessage(), e);
             return Collections.emptyMap();
         }
     }
