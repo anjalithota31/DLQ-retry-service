@@ -563,6 +563,8 @@ consumer.seekToBeginning(consumer.assignment());
                                           String failedIndex,
                                           MetricsCollector metrics) {
         
+        log.info("Starting batch processing for index '{}'. Total records: {}", targetIndex, records.size());
+        
         // Get mapping for this index
         Map<String, Object> mapping = mappingCache.getMapping(targetIndex);
         DocumentRepairer indexRepairer = new DocumentRepairer(mapping, mapper);
@@ -570,6 +572,7 @@ consumer.seekToBeginning(consumer.assignment());
         List<ElasticsearchIndexer.BulkEntry> targetBatch = new ArrayList<>();
         List<ElasticsearchIndexer.FailureEntry> failureBatch = new ArrayList<>();
         Map<String, PendingRecord> pendingById = new LinkedHashMap<>();
+        int parseFailureCount = 0;
         
         // Phase 1: Repair all records in-memory
         for (ConsumerRecord<String, String> record : records) {
@@ -609,11 +612,15 @@ consumer.seekToBeginning(consumer.assignment());
 
             } catch (Exception e) {
                 // Malformed JSON or unexpected repair crash — store directly in failed-docs
-                log.error("Failed to parse/repair DLQ record. offset={}. Storing in failed-docs index.",
-                        record.offset(), e);
+                parseFailureCount++;
+                log.error("Failed to parse/repair DLQ record. offset={}, key={}. Storing in failed-docs index.",
+                        record.offset(), record.key(), e);
                 storeParseFailure(record, e, indexer, failedIndex, targetIndex, mapper);
             }
         }
+        
+        log.info("Phase 1 complete. Repaired: {}, Parse failures: {}, Unconvertible field failures: {}", 
+                targetBatch.size(), parseFailureCount, failureBatch.size());
         
         // Phase 2: Bulk index repaired docs → target index
         Map<String, String> failedIdsWithReasons = indexer.bulkIndex(targetIndex, targetBatch);
@@ -636,7 +643,7 @@ consumer.seekToBeginning(consumer.assignment());
             }
         }
         
-        log.info("Preparing to index {} successful documents to '{}' for tracking", successBatch.size(), failedIndex);
+        log.info("Phase 3: Successful documents to track: {}", successBatch.size());
         if (!successBatch.isEmpty()) {
             List<String> failedSuccessDocs = indexer.bulkIndexFailures(failedIndex, successBatch);
             if (failedSuccessDocs.isEmpty()) {
@@ -647,7 +654,7 @@ consumer.seekToBeginning(consumer.assignment());
         }
 
         // Phase 4: Bulk index unconvertible field failures to failed-docs index
-        log.info("Preparing to index {} unconvertible field failures to '{}'", failureBatch.size(), failedIndex);
+        log.info("Phase 4: Unconvertible field failures to track: {}", failureBatch.size());
         if (!failureBatch.isEmpty()) {
             List<String> failedUnconvertibleDocs = indexer.bulkIndexFailures(failedIndex, failureBatch);
             if (failedUnconvertibleDocs.isEmpty()) {
@@ -658,6 +665,7 @@ consumer.seekToBeginning(consumer.assignment());
         }
 
         // Phase 5: Store permanently failed docs in dlq-failed-documents with actual ES error details
+        log.info("Phase 5: Permanent ES indexing failures to track: {}", failedIdsWithReasons.size());
         List<ElasticsearchIndexer.FailureEntry> permanentFailures = new ArrayList<>();
         for (String failedId : failedIdsWithReasons.keySet()) {
             PendingRecord pending = pendingById.get(failedId);
@@ -690,6 +698,11 @@ consumer.seekToBeginning(consumer.assignment());
                 log.error("Failed to index {} permanent failures to '{}': {}", failedPermanentDocs.size(), failedIndex, failedPermanentDocs);
             }
         }
+        
+        // Summary log for batch processing
+        int totalStoredInFailedIndex = successBatch.size() + failureBatch.size() + permanentFailures.size() + parseFailureCount;
+        log.info("Batch processing summary for index '{}': Input records={}, Stored in failed-docs index={} (Success={}, Unconvertible={}, Permanent ES failures={}, Parse failures={})",
+                targetIndex, records.size(), totalStoredInFailedIndex, successBatch.size(), failureBatch.size(), permanentFailures.size(), parseFailureCount);
     }
     
     /**
@@ -948,11 +961,11 @@ consumer.seekToBeginning(consumer.assignment());
                             .properties("documentId", p -> p.keyword(k -> k))
                             .properties("status", p -> p.keyword(k -> k))
                             .properties("failureReason", p -> p.text(t -> t))
-                            .properties("problematicFields", p -> p.object(o -> o
-                                    .properties("fieldName", pf -> pf.text(t -> t))))
+                            .properties("problematicFields", p -> p.object(o -> o.dynamic(co.elastic.clients.elasticsearch._types.mapping.DynamicMapping.True)))
                             .properties("esErrorDetails", p -> p.text(t -> t))
                             .properties("failedAt", p -> p.date(d -> d))
-                            .properties("originalDocument", p -> p.object(o -> o.enabled(true)))));
+                            .properties("originalDocument", p -> p.object(o -> o.dynamic(co.elastic.clients.elasticsearch._types.mapping.DynamicMapping.True)))
+                            .properties("succeededAt", p -> p.date(d -> d))));
             
             log.info("Successfully created failed documents index '{}'", indexName);
             
