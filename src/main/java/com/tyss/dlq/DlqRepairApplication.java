@@ -633,15 +633,25 @@ consumer.seekToBeginning(consumer.assignment());
             }
         }
         
+        log.info("Preparing to index {} successful documents to '{}' for tracking", successBatch.size(), failedIndex);
         if (!successBatch.isEmpty()) {
-            indexer.bulkIndexFailures(failedIndex, successBatch);
-            log.info("Bulk indexed {} successful documents to '{}' for tracking", successBatch.size(), failedIndex);
+            List<String> failedSuccessDocs = indexer.bulkIndexFailures(failedIndex, successBatch);
+            if (failedSuccessDocs.isEmpty()) {
+                log.info("Bulk indexed {} successful documents to '{}' for tracking", successBatch.size(), failedIndex);
+            } else {
+                log.error("Failed to index {} successful documents to '{}': {}", failedSuccessDocs.size(), failedIndex, failedSuccessDocs);
+            }
         }
 
         // Phase 4: Bulk index unconvertible field failures to failed-docs index
+        log.info("Preparing to index {} unconvertible field failures to '{}'", failureBatch.size(), failedIndex);
         if (!failureBatch.isEmpty()) {
-            indexer.bulkIndexFailures(failedIndex, failureBatch);
-            log.info("Bulk indexed {} unconvertible field failures to '{}'", failureBatch.size(), failedIndex);
+            List<String> failedUnconvertibleDocs = indexer.bulkIndexFailures(failedIndex, failureBatch);
+            if (failedUnconvertibleDocs.isEmpty()) {
+                log.info("Bulk indexed {} unconvertible field failures to '{}'", failureBatch.size(), failedIndex);
+            } else {
+                log.error("Failed to index {} unconvertible field failures to '{}': {}", failedUnconvertibleDocs.size(), failedIndex, failedUnconvertibleDocs);
+            }
         }
 
         // Phase 5: Store permanently failed docs in dlq-failed-documents with actual ES error details
@@ -668,9 +678,14 @@ consumer.seekToBeginning(consumer.assignment());
             }
         }
         
+        log.info("Preparing to index {} permanent failures to '{}'", permanentFailures.size(), failedIndex);
         if (!permanentFailures.isEmpty()) {
-            indexer.bulkIndexFailures(failedIndex, permanentFailures);
-            log.info("Bulk indexed {} permanent failures to '{}'", permanentFailures.size(), failedIndex);
+            List<String> failedPermanentDocs = indexer.bulkIndexFailures(failedIndex, permanentFailures);
+            if (failedPermanentDocs.isEmpty()) {
+                log.info("Bulk indexed {} permanent failures to '{}'", permanentFailures.size(), failedIndex);
+            } else {
+                log.error("Failed to index {} permanent failures to '{}': {}", failedPermanentDocs.size(), failedIndex, failedPermanentDocs);
+            }
         }
     }
     
