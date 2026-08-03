@@ -17,7 +17,7 @@ public class FailedDocument {
     private final Map<String, String> problematicFields;
     private final String esErrorDetails;
     private final String failedAt;
-    private final Map<String, Object> originalDocument;
+    private final String originalDocument;
 
     public FailedDocument(String indexName, String documentId, String failureReason, Map<String, String> problematicFields) {
         this(indexName, documentId, failureReason, problematicFields, null, null);
@@ -28,7 +28,7 @@ public class FailedDocument {
     }
 
     public FailedDocument(String indexName, String documentId, String failureReason, Map<String, String> problematicFields,
-                         String esErrorDetails, Map<String, Object> originalDocument) {
+                         String esErrorDetails, String originalDocument) {
         this.indexName         = indexName;
         this.documentId        = documentId;
         this.status            = "FAILED";
@@ -46,5 +46,5 @@ public class FailedDocument {
     public Map<String, String> getProblematicFields() { return problematicFields; }
     public String getEsErrorDetails()    { return esErrorDetails; }
     public String getFailedAt()          { return failedAt; }
-    public Map<String, Object> getOriginalDocument() { return originalDocument; }
+    public String getOriginalDocument()  { return originalDocument; }
 }

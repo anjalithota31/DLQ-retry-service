@@ -473,9 +473,12 @@ consumer.seekToBeginning(consumer.assignment());
             @SuppressWarnings("unchecked")
             Map<String, Object> originalDoc = mapper.readValue(record.value(), Map.class);
             
+            // Convert original document to JSON string to avoid ES mapping conflicts
+            String originalDocJson = mapper.writeValueAsString(originalDoc);
+            
             // Create failure document for bulk storage with problematic fields, reasons, and original document
             FailedDocument failedDoc = new FailedDocument(targetIndex, esId, reason.toString(), 
-                    problematicFieldsWithReasons, null, originalDoc);
+                    problematicFieldsWithReasons, null, originalDocJson);
             
             // Return the document WITHOUT unconvertible fields for indexing to target
             Map<String, Object> cleanedDoc = new LinkedHashMap<>(repairResult.getDocument());
@@ -690,8 +693,9 @@ consumer.seekToBeginning(consumer.assignment());
             try {
                 @SuppressWarnings("unchecked")
                 Map<String, Object> originalDoc = mapper.readValue(pending.record.value(), Map.class);
+                String originalDocJson = mapper.writeValueAsString(originalDoc);
                 FailedDocument failedDoc = new FailedDocument(targetIndex, failedId, actualReason, 
-                        problematicFields, actualReason, originalDoc);
+                        problematicFields, actualReason, originalDocJson);
                 permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
                         failedId, mapper.convertValue(failedDoc, Map.class)));
             } catch (Exception e) {
@@ -982,7 +986,7 @@ consumer.seekToBeginning(consumer.assignment());
                             .properties("problematicFields", p -> p.object(o -> o.dynamic(co.elastic.clients.elasticsearch._types.mapping.DynamicMapping.True)))
                             .properties("esErrorDetails", p -> p.text(t -> t))
                             .properties("failedAt", p -> p.date(d -> d))
-                            .properties("originalDocument", p -> p.object(o -> o.dynamic(co.elastic.clients.elasticsearch._types.mapping.DynamicMapping.True)))
+                            .properties("originalDocument", p -> p.text(t -> t))
                             .properties("succeededAt", p -> p.date(d -> d))));
             
             log.info("Successfully created failed documents index '{}'", indexName);
