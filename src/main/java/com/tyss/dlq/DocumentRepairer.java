@@ -24,7 +24,7 @@ public class DocumentRepairer {
     private static final Logger log = LoggerFactory.getLogger(DocumentRepairer.class);
 
     // Metadata field prefixes that should be filtered out before indexing to target
-    private static final String[] METADATA_PREFIXES = {"ignored_", "__connect", "__dlq", "_dlq"};
+    private static final String[] METADATA_PREFIXES = {"ignored_", "__connect", "__dlq", "_dlq", "_ignored"};
 
     private final Map<String, Object> indexMapping;  // ES "properties" map
     private final ObjectMapper mapper;
