@@ -145,6 +145,9 @@ public class DlqRepairApplication {
         log.info("Elasticsearch client built. url={}, auth={}, sslVerify={}",
                 finalEsUrl, !esUser.isEmpty(), sslVerify);
 
+        // Create failed documents index if it doesn't exist
+        createFailedDocumentsIndex(esClient, finalFailedIndex);
+
         ObjectMapper mapper = new ObjectMapper();
 
         // Initialize mapping cache for dynamic multi-index support
@@ -920,5 +923,42 @@ consumer.seekToBeginning(consumer.assignment());
         props.forEach((k, v) -> System.out.println(k + " = " + v));
         
         return new KafkaConsumer<>(props);
+    }
+
+    /**
+     * Creates the failed documents index with proper mappings if it doesn't exist.
+     */
+    private static void createFailedDocumentsIndex(ElasticsearchClient esClient, String indexName) {
+        try {
+            // Check if index exists
+            boolean exists = esClient.indices().exists(e -> e.index(indexName)).value();
+            
+            if (exists) {
+                log.info("Failed documents index '{}' already exists", indexName);
+                return;
+            }
+            
+            log.info("Creating failed documents index '{}' with mappings", indexName);
+            
+            // Create index with mappings for FailedDocument structure
+            esClient.indices().create(c -> c
+                    .index(indexName)
+                    .mappings(m -> m
+                            .properties("indexName", p -> p.keyword(k -> k))
+                            .properties("documentId", p -> p.keyword(k -> k))
+                            .properties("status", p -> p.keyword(k -> k))
+                            .properties("failureReason", p -> p.text(t -> t))
+                            .properties("problematicFields", p -> p.object(o -> o
+                                    .properties("fieldName", pf -> pf.text(t -> t))))
+                            .properties("esErrorDetails", p -> p.text(t -> t))
+                            .properties("failedAt", p -> p.date(d -> d))
+                            .properties("originalDocument", p -> p.object(o -> o.enabled(true)))));
+            
+            log.info("Successfully created failed documents index '{}'", indexName);
+            
+        } catch (Exception e) {
+            log.warn("Failed to create failed documents index '{}'. Will rely on auto-creation.", indexName, e);
+            // Don't fail startup - ES may auto-create the index
+        }
     }
 }
