@@ -5,7 +5,8 @@ import java.util.Map;
 
 /**
  * Failure record stored in the failed-documents index.
- * Contains indexName, _id, failure reason, problematic fields with reasons, and ES error details for tracking purposes.
+ * Contains indexName, _id, failure reason, problematic fields with reasons, ES error details,
+ * and original document content for debugging purposes.
  */
 public class FailedDocument {
 
@@ -16,25 +17,26 @@ public class FailedDocument {
     private final Map<String, String> problematicFields;
     private final String esErrorDetails;
     private final String failedAt;
+    private final Map<String, Object> originalDocument;
 
     public FailedDocument(String indexName, String documentId, String failureReason, Map<String, String> problematicFields) {
+        this(indexName, documentId, failureReason, problematicFields, null, null);
+    }
+
+    public FailedDocument(String indexName, String documentId, String failureReason, String esErrorDetails) {
+        this(indexName, documentId, failureReason, null, esErrorDetails, null);
+    }
+
+    public FailedDocument(String indexName, String documentId, String failureReason, Map<String, String> problematicFields,
+                         String esErrorDetails, Map<String, Object> originalDocument) {
         this.indexName         = indexName;
         this.documentId        = documentId;
         this.status            = "FAILED";
         this.failureReason     = failureReason;
         this.problematicFields = problematicFields;
-        this.esErrorDetails    = null;
-        this.failedAt          = Instant.now().toString();
-    }
-
-    public FailedDocument(String indexName, String documentId, String failureReason, String esErrorDetails) {
-        this.indexName         = indexName;
-        this.documentId        = documentId;
-        this.status            = "FAILED";
-        this.failureReason     = failureReason;
-        this.problematicFields = null;
         this.esErrorDetails    = esErrorDetails;
         this.failedAt          = Instant.now().toString();
+        this.originalDocument  = originalDocument;
     }
 
     public String getIndexName()         { return indexName; }
@@ -44,4 +46,5 @@ public class FailedDocument {
     public Map<String, String> getProblematicFields() { return problematicFields; }
     public String getEsErrorDetails()    { return esErrorDetails; }
     public String getFailedAt()          { return failedAt; }
+    public Map<String, Object> getOriginalDocument() { return originalDocument; }
 }

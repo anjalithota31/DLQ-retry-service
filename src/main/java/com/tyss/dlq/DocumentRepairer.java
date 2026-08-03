@@ -23,12 +23,27 @@ public class DocumentRepairer {
 
     private static final Logger log = LoggerFactory.getLogger(DocumentRepairer.class);
 
+    // Metadata field prefixes that should be filtered out before indexing to target
+    private static final String[] METADATA_PREFIXES = {"ignored_", "__connect", "__dlq", "_dlq"};
+
     private final Map<String, Object> indexMapping;  // ES "properties" map
     private final ObjectMapper mapper;
 
     public DocumentRepairer(Map<String, Object> indexMapping, ObjectMapper mapper) {
         this.indexMapping = indexMapping;
         this.mapper = mapper;
+    }
+
+    /**
+     * Checks if a field name is metadata that should be filtered out before indexing to target.
+     */
+    private boolean isMetadataField(String fieldName) {
+        for (String prefix : METADATA_PREFIXES) {
+            if (fieldName.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -47,6 +62,13 @@ public class DocumentRepairer {
         for (Map.Entry<String, Object> entry : document.entrySet()) {
             String fieldName  = entry.getKey();
             Object fieldValue = entry.getValue();
+
+            // Filter out metadata fields (ignored_fields, __connect, etc.)
+            if (isMetadataField(fieldName)) {
+                repairedDoc.remove(fieldName);
+                log.debug("Filtered out metadata field: '{}'", fieldName);
+                continue;
+            }
 
             if (!indexMapping.containsKey(fieldName)) {
                 // Field not in mapping - treat as unconvertible
@@ -110,6 +132,13 @@ public class DocumentRepairer {
             String fieldName = entry.getKey();
             Object fieldValue = entry.getValue();
             String fullPath = pathPrefix.isEmpty() ? fieldName : pathPrefix + "." + fieldName;
+
+            // Filter out metadata fields at nested levels
+            if (isMetadataField(fieldName)) {
+                document.remove(fieldName);
+                log.debug("Filtered out nested metadata field: '{}'", fullPath);
+                continue;
+            }
 
             if (fieldValue == null || !(fieldValue instanceof Map)) {
                 continue; // Skip null values and non-object values

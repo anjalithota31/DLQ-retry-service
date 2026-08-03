@@ -465,15 +465,29 @@ consumer.seekToBeginning(consumer.assignment());
             reason.setLength(reason.length() - 2); // Remove trailing comma
         }
         
-        // Create failure document for bulk storage with problematic fields and reasons
-        FailedDocument failedDoc = new FailedDocument(targetIndex, esId, reason.toString(), 
-                problematicFieldsWithReasons);
-        
-        // Return the document WITHOUT unconvertible fields for indexing to target
-        Map<String, Object> cleanedDoc = new LinkedHashMap<>(repairResult.getDocument());
-        problematicFieldsWithReasons.keySet().forEach(cleanedDoc::remove);
-        
-        return new UnconvertibleFieldResult(cleanedDoc, failedDoc, esId);
+        // Get original document for debugging
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> originalDoc = mapper.readValue(record.value(), Map.class);
+            
+            // Create failure document for bulk storage with problematic fields, reasons, and original document
+            FailedDocument failedDoc = new FailedDocument(targetIndex, esId, reason.toString(), 
+                    problematicFieldsWithReasons, null, originalDoc);
+            
+            // Return the document WITHOUT unconvertible fields for indexing to target
+            Map<String, Object> cleanedDoc = new LinkedHashMap<>(repairResult.getDocument());
+            problematicFieldsWithReasons.keySet().forEach(cleanedDoc::remove);
+            
+            return new UnconvertibleFieldResult(cleanedDoc, failedDoc, esId);
+        } catch (Exception e) {
+            log.error("Failed to parse original document for unconvertible field tracking. id={}", esId, e);
+            // Fallback without original document
+            FailedDocument failedDoc = new FailedDocument(targetIndex, esId, reason.toString(), 
+                    problematicFieldsWithReasons);
+            Map<String, Object> cleanedDoc = new LinkedHashMap<>(repairResult.getDocument());
+            problematicFieldsWithReasons.keySet().forEach(cleanedDoc::remove);
+            return new UnconvertibleFieldResult(cleanedDoc, failedDoc, esId);
+        }
     }
 
     /** Helper class to hold unconvertible field processing results. */
@@ -637,9 +651,21 @@ consumer.seekToBeginning(consumer.assignment());
             if (pending == null) continue;
             String actualReason = failedIdsWithReasons.get(failedId);
             log.error("ES indexing failed after repair. id={}, reason={}", failedId, actualReason);
-            FailedDocument failedDoc = new FailedDocument(targetIndex, failedId, actualReason, actualReason);
-            permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
-                    failedId, mapper.convertValue(failedDoc, Map.class)));
+            
+            // Include original document for debugging
+            try {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> originalDoc = mapper.readValue(pending.record.value(), Map.class);
+                FailedDocument failedDoc = new FailedDocument(targetIndex, failedId, actualReason, null, actualReason, originalDoc);
+                permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
+                        failedId, mapper.convertValue(failedDoc, Map.class)));
+            } catch (Exception e) {
+                log.error("Failed to parse original document for permanent failure tracking. id={}", failedId, e);
+                // Fallback without original document
+                FailedDocument failedDoc = new FailedDocument(targetIndex, failedId, actualReason, actualReason);
+                permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
+                        failedId, mapper.convertValue(failedDoc, Map.class)));
+            }
         }
         
         if (!permanentFailures.isEmpty()) {
