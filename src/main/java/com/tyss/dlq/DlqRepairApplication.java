@@ -650,7 +650,10 @@ consumer.seekToBeginning(consumer.assignment());
                 log.info("Bulk indexed {} successful documents to '{}' for tracking", successBatch.size(), failedIndex);
             } else {
                 log.error("Failed to index {} successful documents to '{}': {}", failedSuccessDocs.size(), failedIndex, failedSuccessDocs);
+                metrics.incrementRecordsFailed(failedSuccessDocs.size());
             }
+        } else {
+            log.warn("Phase 3: No successful documents to track");
         }
 
         // Phase 4: Bulk index unconvertible field failures to failed-docs index
@@ -661,7 +664,10 @@ consumer.seekToBeginning(consumer.assignment());
                 log.info("Bulk indexed {} unconvertible field failures to '{}'", failureBatch.size(), failedIndex);
             } else {
                 log.error("Failed to index {} unconvertible field failures to '{}': {}", failedUnconvertibleDocs.size(), failedIndex, failedUnconvertibleDocs);
+                metrics.incrementRecordsFailed(failedUnconvertibleDocs.size());
             }
+        } else {
+            log.warn("Phase 4: No unconvertible field failures to track");
         }
 
         // Phase 5: Store permanently failed docs in dlq-failed-documents with actual ES error details
@@ -705,7 +711,10 @@ consumer.seekToBeginning(consumer.assignment());
                 log.info("Bulk indexed {} permanent failures to '{}'", permanentFailures.size(), failedIndex);
             } else {
                 log.error("Failed to index {} permanent failures to '{}': {}", failedPermanentDocs.size(), failedIndex, failedPermanentDocs);
+                metrics.incrementRecordsFailed(failedPermanentDocs.size());
             }
+        } else {
+            log.warn("Phase 5: No permanent ES failures to track");
         }
         
         // Summary log for batch processing
