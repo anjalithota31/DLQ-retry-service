@@ -673,17 +673,26 @@ consumer.seekToBeginning(consumer.assignment());
             String actualReason = failedIdsWithReasons.get(failedId);
             log.error("ES indexing failed after repair. id={}, reason={}", failedId, actualReason);
             
+            // Build problematicFields map from repair result
+            Map<String, String> problematicFields = new LinkedHashMap<>();
+            if (pending.repairResult != null && !pending.repairResult.getUnconvertibleFields().isEmpty()) {
+                pending.repairResult.getUnconvertibleFields().forEach((fieldName, unconvertibleField) -> 
+                    problematicFields.put(fieldName, unconvertibleField.getReason()));
+            }
+            
             // Include original document for debugging
             try {
                 @SuppressWarnings("unchecked")
                 Map<String, Object> originalDoc = mapper.readValue(pending.record.value(), Map.class);
-                FailedDocument failedDoc = new FailedDocument(targetIndex, failedId, actualReason, null, actualReason, originalDoc);
+                FailedDocument failedDoc = new FailedDocument(targetIndex, failedId, actualReason, 
+                        problematicFields, actualReason, originalDoc);
                 permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
                         failedId, mapper.convertValue(failedDoc, Map.class)));
             } catch (Exception e) {
                 log.error("Failed to parse original document for permanent failure tracking. id={}", failedId, e);
-                // Fallback without original document
-                FailedDocument failedDoc = new FailedDocument(targetIndex, failedId, actualReason, actualReason);
+                // Fallback without original document but with problematicFields
+                FailedDocument failedDoc = new FailedDocument(targetIndex, failedId, actualReason, 
+                        problematicFields);
                 permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
                         failedId, mapper.convertValue(failedDoc, Map.class)));
             }

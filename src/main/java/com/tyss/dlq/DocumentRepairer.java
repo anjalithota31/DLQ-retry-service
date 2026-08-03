@@ -148,7 +148,23 @@ public class DocumentRepairer {
             Map<String, Object> fieldMapping = (Map<String, Object>) mapping.get(fieldName);
 
             if (fieldMapping == null) {
-                continue; // No mapping for this field, skip nested repair
+                // No mapping for this field - check if it's a nested object with same name as parent
+                // This handles cases like defectDetails.defectDetails where the inner object
+                // should be merged/flattened according to the parent's mapping
+                log.warn("Field '{}' has no mapping but is an object. Checking if nested fields match parent mapping.", fullPath);
+                
+                // Try to repair nested fields using parent mapping if field name matches a parent key
+                if (mapping.containsKey(fieldName)) {
+                    fieldMapping = (Map<String, Object>) mapping.get(fieldName);
+                    log.debug("Found mapping for '{}' in parent, using it for nested repair", fullPath);
+                } else {
+                    // No mapping available, mark entire nested object as unconvertible
+                    document.remove(fieldName);
+                    unconvertibleFields.put(fullPath, new RepairResult.UnconvertibleField(
+                            toRawString(fieldValue), "object", "Nested object has no mapping"));
+                    log.warn("Nested object '{}' has no mapping - marked as unconvertible", fullPath);
+                    continue;
+                }
             }
 
             String esType = (String) fieldMapping.getOrDefault("type", "object");
@@ -360,7 +376,14 @@ public class DocumentRepairer {
 
     private RepairOutcome repairObject(String fieldName, Object value, String esType) {
         if (value == null) return RepairOutcome.valid();
-        if (value instanceof Map) return RepairOutcome.valid();
+        if (value instanceof Map) {
+            // Check if the map is empty - this might indicate a type mismatch
+            Map<?, ?> mapValue = (Map<?, ?>) value;
+            if (mapValue.isEmpty()) {
+                return RepairOutcome.unconvertible("Empty object provided for field '" + fieldName + "' of type " + esType);
+            }
+            return RepairOutcome.valid();
+        }
         // Concrete value (string, number, etc.) where object is expected
         return RepairOutcome.unconvertible("Expected object for field '" + fieldName + "' but found " + value.getClass().getSimpleName() + " value: " + value);
     }
