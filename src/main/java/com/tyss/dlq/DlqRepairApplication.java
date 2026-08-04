@@ -105,6 +105,7 @@ public class DlqRepairApplication {
         int maxRetries = Integer.parseInt(getConfig.apply("max.retries"));
         if (maxRetries == 0) maxRetries = 3;
         final int maxConversionRetries = Integer.parseInt(getConfig.apply("max.conversion.retries")) == 0 ? 3 : Integer.parseInt(getConfig.apply("max.conversion.retries"));
+        final int maxFieldRemovalRetries = Integer.parseInt(getConfig.apply("max.field.removal.retries")) == 0 ? 5 : Integer.parseInt(getConfig.apply("max.field.removal.retries"));
         long retryBackoffMs = Long.parseLong(getConfig.apply("retry.backoff.ms"));
         if (retryBackoffMs == 0) retryBackoffMs = 100;
         
@@ -311,7 +312,25 @@ consumer.seekToBeginning(consumer.assignment());
             healthCheckServer.setHealthMessage("Shutting down");
             try { consumer.commitSync(); } catch (Exception ignored) {}
             consumer.close();
+
+            // Graceful shutdown of thread pool
             threadPool.shutdown();
+            try {
+                if (!threadPool.awaitTermination(30, TimeUnit.SECONDS)) {
+                    log.warn("Thread pool did not terminate in 30 seconds, forcing shutdown");
+                    threadPool.shutdownNow();
+                    if (!threadPool.awaitTermination(10, TimeUnit.SECONDS)) {
+                        log.error("Thread pool did not terminate after forced shutdown");
+                    }
+                } else {
+                    log.info("Thread pool terminated gracefully");
+                }
+            } catch (InterruptedException ie) {
+                log.warn("Thread pool shutdown interrupted", ie);
+                threadPool.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+
             try {
                 esClient.close();
             } catch (IOException e) {
@@ -377,8 +396,8 @@ consumer.seekToBeginning(consumer.assignment());
                 
                 futures.add(threadPool.submit(() -> {
                     try {
-                        processIndexBatch(indexTarget, indexRecords, mapper, mappingCache, 
-                                indexer, finalFailedIndex, finalCorrectedIndex, metrics, maxConversionRetries);
+                        processIndexBatch(indexTarget, indexRecords, mapper, mappingCache,
+                                indexer, finalFailedIndex, finalCorrectedIndex, metrics, maxConversionRetries, maxFieldRemovalRetries);
                     } catch (Exception e) {
                         log.error("Error processing batch for index '{}'", indexTarget, e);
                         throw new RuntimeException(e);
@@ -575,7 +594,8 @@ consumer.seekToBeginning(consumer.assignment());
                                           String failedIndex,
                                           String correctedIndex,
                                           MetricsCollector metrics,
-                                          int maxConversionRetries) {
+                                          int maxConversionRetries,
+                                          int maxFieldRemovalRetries) {
         
         log.info("Starting batch processing for index '{}'. Total records: {}", targetIndex, records.size());
         
@@ -656,7 +676,7 @@ consumer.seekToBeginning(consumer.assignment());
                         entry.id, mapper.convertValue(successDoc, Map.class)));
             }
         }
-        
+
         log.info("Phase 3: Successful documents to track: {}", successBatch.size());
         if (!successBatch.isEmpty()) {
             List<String> failedSuccessDocs = indexer.bulkIndexFailures(failedIndex, successBatch);
@@ -665,6 +685,8 @@ consumer.seekToBeginning(consumer.assignment());
             } else {
                 log.error("Failed to index {} successful documents to '{}': {}", failedSuccessDocs.size(), failedIndex, failedSuccessDocs);
                 metrics.incrementRecordsFailed(failedSuccessDocs.size());
+                metrics.incrementFailedDocsIndexFailures(failedSuccessDocs.size());
+                logToFallbackFile("success_tracking_failed", targetIndex, failedSuccessDocs, mapper);
             }
         } else {
             log.warn("Phase 3: No successful documents to track");
@@ -679,6 +701,8 @@ consumer.seekToBeginning(consumer.assignment());
             } else {
                 log.error("Failed to index {} unconvertible field failures to '{}': {}", failedUnconvertibleDocs.size(), failedIndex, failedUnconvertibleDocs);
                 metrics.incrementRecordsFailed(failedUnconvertibleDocs.size());
+                metrics.incrementFailedDocsIndexFailures(failedUnconvertibleDocs.size());
+                logToFallbackFile("unconvertible_tracking_failed", targetIndex, failedUnconvertibleDocs, mapper);
             }
         } else {
             log.warn("Phase 4: No unconvertible field failures to track");
@@ -688,8 +712,7 @@ consumer.seekToBeginning(consumer.assignment());
         log.info("Phase 5: ES indexing failures to handle with field removal and retry: {}", failedIdsWithReasons.size());
         List<ElasticsearchIndexer.FailureEntry> permanentFailures = new ArrayList<>();
         List<ElasticsearchIndexer.FailureEntry> correctedDocs = new ArrayList<>();
-        int maxFieldRemovalRetries = 5; // Max number of fields to remove per document
-        
+
         for (String failedId : failedIdsWithReasons.keySet()) {
             PendingRecord pending = pendingById.get(failedId);
             if (pending == null) {
@@ -769,9 +792,9 @@ consumer.seekToBeginning(consumer.assignment());
                     @SuppressWarnings("unchecked")
                     Map<String, Object> originalDoc = mapper.readValue(pending.record.value(), Map.class);
                     String originalDocJson = mapper.writeValueAsString(originalDoc);
-                    FailedDocument correctedDoc = new FailedDocument(targetIndex, failedId, 
-                            "Successfully indexed after removing " + allRemovedFields.size() + " problematic field(s)", 
-                            allRemovedFields, null, originalDocJson);
+                    FailedDocument correctedDoc = new FailedDocument(targetIndex, failedId,
+                            "Successfully indexed after removing " + allRemovedFields.size() + " problematic field(s)",
+                            allRemovedFields, null, originalDocJson, "SUCCESS");
                     correctedDocs.add(new ElasticsearchIndexer.FailureEntry(
                             failedId, mapper.convertValue(correctedDoc, Map.class)));
                 } catch (Exception e) {
@@ -819,11 +842,13 @@ consumer.seekToBeginning(consumer.assignment());
             } else {
                 log.error("Failed to index {} permanent failures to '{}': {}", failedPermanentDocs.size(), failedIndex, failedPermanentDocs);
                 metrics.incrementRecordsFailed(failedPermanentDocs.size());
+                metrics.incrementFailedDocsIndexFailures(failedPermanentDocs.size());
+                logToFallbackFile("permanent_failure_tracking_failed", targetIndex, failedPermanentDocs, mapper);
             }
         } else {
             log.warn("Phase 5: No permanent ES failures to track");
         }
-        
+
         // Index successfully corrected documents to corrected-documents index
         log.info("Preparing to index {} corrected documents to '{}'", correctedDocs.size(), correctedIndex);
         if (!correctedDocs.isEmpty()) {
@@ -832,6 +857,8 @@ consumer.seekToBeginning(consumer.assignment());
                 log.info("Bulk indexed {} corrected documents to '{}'", correctedDocs.size(), correctedIndex);
             } else {
                 log.error("Failed to index {} corrected documents to '{}': {}", failedCorrectedDocs.size(), correctedIndex, failedCorrectedDocs);
+                metrics.incrementFailedDocsIndexFailures(failedCorrectedDocs.size());
+                logToFallbackFile("corrected_tracking_failed", targetIndex, failedCorrectedDocs, mapper);
             }
         } else {
             log.warn("Phase 5: No corrected documents to track");
@@ -1036,29 +1063,88 @@ consumer.seekToBeginning(consumer.assignment());
 
     /**
      * Extracts the problematic field name from an Elasticsearch error message.
-     * ES error format: "object mapping for [field.name] tried to parse field [field.name] as object, but found a concrete value"
+     * Handles multiple ES error message formats:
+     * - "object mapping for [field.name] tried to parse field [field.name] as object"
+     * - "failed to parse field [field.name] of type [text]"
+     * - "mapper_parsing_exception: failed to parse [field.name]"
+     * - "illegal_argument_exception: mapper [field.name] of different type"
      */
     private static String extractProblematicFieldFromEsError(String esError) {
         if (esError == null || esError.isEmpty()) {
             return null;
         }
-        
-        // Pattern: "for [field.name]" or "field [field.name]"
-        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("\\[([^\\]]+)\\]");
-        java.util.regex.Matcher matcher = pattern.matcher(esError);
-        
-        while (matcher.find()) {
-            String field = matcher.group(1);
+
+        // Pattern 1: Extract field from brackets [field.name]
+        java.util.regex.Pattern bracketPattern = java.util.regex.Pattern.compile("\\[([^\\]]+)\\]");
+        java.util.regex.Matcher bracketMatcher = bracketPattern.matcher(esError);
+
+        while (bracketMatcher.find()) {
+            String field = bracketMatcher.group(1);
             // Return the first field that looks like a field path (contains dots)
             // Also accept fields that might have spaces in them (e.g., "Assign to")
             if (field.contains(".") || field.matches(".*[a-zA-Z].*")) {
-                log.debug("Extracted field '{}' from ES error: {}", field, esError);
+                log.debug("Extracted field '{}' from ES error (bracket pattern): {}", field, esError);
                 return field;
             }
         }
-        
+
+        // Pattern 2: Extract field from "field X" or "for X" patterns
+        java.util.regex.Pattern fieldPattern = java.util.regex.Pattern.compile(
+            "(?:field|for|mapper)\\s+[`\"']?([\\w\\s.-]+)[`\"']?",
+            java.util.regex.Pattern.CASE_INSENSITIVE);
+        java.util.regex.Matcher fieldMatcher = fieldPattern.matcher(esError);
+
+        while (fieldMatcher.find()) {
+            String field = fieldMatcher.group(1).trim();
+            if (field.contains(".") || field.matches(".*[a-zA-Z].*")) {
+                log.debug("Extracted field '{}' from ES error (field pattern): {}", field, esError);
+                return field;
+            }
+        }
+
+        // Pattern 3: Extract field from "parsing_exception" messages
+        java.util.regex.Pattern parsePattern = java.util.regex.Pattern.compile(
+            "parsing.*?([\\w\\s.-]+)",
+            java.util.regex.Pattern.CASE_INSENSITIVE);
+        java.util.regex.Matcher parseMatcher = parsePattern.matcher(esError);
+
+        while (parseMatcher.find()) {
+            String field = parseMatcher.group(1).trim();
+            if (field.length() > 2 && (field.contains(".") || field.matches(".*[a-zA-Z].*"))) {
+                log.debug("Extracted field '{}' from ES error (parse pattern): {}", field, esError);
+                return field;
+            }
+        }
+
         log.warn("Could not extract field from ES error: {}", esError);
         return null;
+    }
+
+    /**
+     * Logs failed document IDs to a fallback file when the failed-documents index is unavailable.
+     * This prevents data loss when the tracking index itself fails.
+     */
+    private static void logToFallbackFile(String failureType, String targetIndex, List<String> failedIds, ObjectMapper mapper) {
+        try {
+            java.nio.file.Path fallbackDir = java.nio.file.Paths.get("logs", "fallback-tracking");
+            java.nio.file.Files.createDirectories(fallbackDir);
+
+            String timestamp = java.time.Instant.now().toString().replace(":", "-");
+            java.nio.file.Path fallbackFile = fallbackDir.resolve(failureType + "_" + timestamp + ".json");
+
+            Map<String, Object> fallbackEntry = new LinkedHashMap<>();
+            fallbackEntry.put("failureType", failureType);
+            fallbackEntry.put("targetIndex", targetIndex);
+            fallbackEntry.put("failedIds", failedIds);
+            fallbackEntry.put("timestamp", java.time.Instant.now().toString());
+
+            String json = mapper.writerWithDefaultPrettyPrinter().writeValueAsString(fallbackEntry);
+            java.nio.file.Files.write(fallbackFile, json.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+            log.warn("Logged {} failed IDs to fallback file: {}", failedIds.size(), fallbackFile);
+        } catch (Exception e) {
+            log.error("Failed to write fallback tracking file for {} failed IDs", failedIds.size(), e);
+        }
     }
 
     /**

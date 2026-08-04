@@ -59,14 +59,10 @@ public class RateLimiter {
                 // Calculate wait time
                 long needed = permits - current;
                 long waitNanos = (needed * refillIntervalNanos) / permitsPerSecond;
-                long waitMs = waitNanos / 1_000_000;
-                
-                if (waitMs > 0) {
-                    log.debug("Rate limiting: waiting {}ms for {} permits", waitMs, permits);
-                    Thread.sleep(waitMs);
-                } else {
-                    Thread.sleep(1); // Minimum sleep to avoid busy waiting
-                }
+                long waitMs = Math.max(waitNanos / 1_000_000, 1); // Minimum 1ms sleep
+
+                log.debug("Rate limiting: waiting {}ms for {} permits", waitMs, permits);
+                Thread.sleep(waitMs);
             }
         }
     }

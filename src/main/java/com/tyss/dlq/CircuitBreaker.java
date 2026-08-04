@@ -19,24 +19,31 @@ public class CircuitBreaker {
     private static final Logger log = LoggerFactory.getLogger(CircuitBreaker.class);
     
     private final int failureThreshold;
+    private final int successThreshold;
     private final long timeoutMs;
     private final AtomicInteger failureCount = new AtomicInteger(0);
+    private final AtomicInteger successCount = new AtomicInteger(0);
     private final AtomicLong lastFailureTime = new AtomicLong(0);
     private volatile State state = State.CLOSED;
-    
+
     public enum State {
         CLOSED,    // Normal operation
         OPEN,      // Circuit is open, failing fast
         HALF_OPEN  // Testing if service recovered
     }
-    
+
     public CircuitBreaker(int failureThreshold, long timeoutMs) {
+        this(failureThreshold, 3, timeoutMs); // default: 3 successes to close from HALF_OPEN
+    }
+
+    public CircuitBreaker(int failureThreshold, int successThreshold, long timeoutMs) {
         this.failureThreshold = failureThreshold;
+        this.successThreshold = successThreshold;
         this.timeoutMs = timeoutMs;
     }
-    
+
     public CircuitBreaker() {
-        this(5, 60000); // default: 5 failures, 60 second timeout
+        this(5, 3, 60000); // default: 5 failures, 3 successes, 60 second timeout
     }
     
     /**
@@ -88,11 +95,18 @@ public class CircuitBreaker {
      */
     public void onSuccess() {
         if (state == State.HALF_OPEN) {
-            log.info("Circuit breaker transitioning from HALF_OPEN to CLOSED");
-            state = State.CLOSED;
-            failureCount.set(0);
+            int successes = successCount.incrementAndGet();
+            if (successes >= successThreshold) {
+                log.info("Circuit breaker transitioning from HALF_OPEN to CLOSED after {} successes", successes);
+                state = State.CLOSED;
+                failureCount.set(0);
+                successCount.set(0);
+            } else {
+                log.debug("Circuit breaker in HALF_OPEN state, success count: {}/{}", successes, successThreshold);
+            }
         } else if (state == State.CLOSED) {
             failureCount.set(0);
+            successCount.set(0);
         }
     }
     
@@ -102,11 +116,12 @@ public class CircuitBreaker {
     public void onFailure() {
         int failures = failureCount.incrementAndGet();
         lastFailureTime.set(System.currentTimeMillis());
-        
+
         if (failures >= failureThreshold) {
             if (state != State.OPEN) {
                 log.warn("Circuit breaker transitioning to OPEN after {} failures", failures);
                 state = State.OPEN;
+                successCount.set(0); // Reset success count when opening
             }
         }
     }

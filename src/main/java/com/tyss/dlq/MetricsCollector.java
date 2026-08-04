@@ -37,6 +37,9 @@ public class MetricsCollector {
     // Circuit breaker metrics
     private final AtomicLong circuitBreakerOpens = new AtomicLong(0);
     private final AtomicLong circuitBreakerCloses = new AtomicLong(0);
+
+    // Failed-documents index metrics
+    private final AtomicLong failedDocsIndexFailures = new AtomicLong(0);
     
     public void incrementRecordsProcessed() {
         recordsProcessed.incrementAndGet();
@@ -105,6 +108,14 @@ public class MetricsCollector {
     public void incrementCircuitBreakerCloses() {
         circuitBreakerCloses.incrementAndGet();
     }
+
+    public void incrementFailedDocsIndexFailures() {
+        failedDocsIndexFailures.incrementAndGet();
+    }
+
+    public void incrementFailedDocsIndexFailures(long count) {
+        failedDocsIndexFailures.addAndGet(count);
+    }
     
     public String getMetricsSummary() {
         long processed = recordsProcessed.get();
@@ -119,10 +130,11 @@ public class MetricsCollector {
         return String.format(
             "Metrics: processed=%d, succeeded=%d (%.2f%%), failed=%d, repaired=%d, unconvertible=%d, " +
             "avgProcessingTime=%.2fms, transientFailures=%d, permanentFailures=%d, " +
-            "esBulkOps=%d, esRetries=%d, circuitBreakerOpens=%d, circuitBreakerCloses=%d",
+            "esBulkOps=%d, esRetries=%d, circuitBreakerOpens=%d, circuitBreakerCloses=%d, failedDocsIndexFailures=%d",
             processed, succeeded, successRate, failed, repaired, unconvertible,
             avgProcessingTime, transientFailures.get(), permanentFailures.get(),
-            esBulkOperations.get(), esBulkRetries.get(), circuitBreakerOpens.get(), circuitBreakerCloses.get()
+            esBulkOperations.get(), esBulkRetries.get(), circuitBreakerOpens.get(), circuitBreakerCloses.get(),
+            failedDocsIndexFailures.get()
         );
     }
     
@@ -145,5 +157,6 @@ public class MetricsCollector {
         esBulkRetries.set(0);
         circuitBreakerOpens.set(0);
         circuitBreakerCloses.set(0);
+        failedDocsIndexFailures.set(0);
     }
 }

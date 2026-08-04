@@ -20,18 +20,23 @@ public class FailedDocument {
     private final String originalDocument;
 
     public FailedDocument(String indexName, String documentId, String failureReason, Map<String, String> problematicFields) {
-        this(indexName, documentId, failureReason, problematicFields, null, null);
+        this(indexName, documentId, failureReason, problematicFields, null, null, "FAILED");
     }
 
     public FailedDocument(String indexName, String documentId, String failureReason, String esErrorDetails) {
-        this(indexName, documentId, failureReason, null, esErrorDetails, null);
+        this(indexName, documentId, failureReason, null, esErrorDetails, null, "FAILED");
     }
 
     public FailedDocument(String indexName, String documentId, String failureReason, Map<String, String> problematicFields,
                          String esErrorDetails, String originalDocument) {
+        this(indexName, documentId, failureReason, problematicFields, esErrorDetails, originalDocument, "FAILED");
+    }
+
+    public FailedDocument(String indexName, String documentId, String failureReason, Map<String, String> problematicFields,
+                         String esErrorDetails, String originalDocument, String status) {
         this.indexName         = indexName;
         this.documentId        = documentId;
-        this.status            = "FAILED";
+        this.status            = status;
         this.failureReason     = failureReason;
         this.problematicFields = problematicFields;
         this.esErrorDetails    = esErrorDetails;

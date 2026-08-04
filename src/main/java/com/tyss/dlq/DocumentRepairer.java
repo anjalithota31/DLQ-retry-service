@@ -431,6 +431,14 @@ public class DocumentRepairer {
         if (value instanceof Number || value instanceof Boolean) {
             return RepairOutcome.repaired(String.valueOf(value), "SCALAR_TO_" + esType.toUpperCase());
         }
+        if (value instanceof Map) {
+            Map<?, ?> mapValue = (Map<?, ?>) value;
+            if (mapValue.isEmpty()) {
+                // Empty object - convert to empty string for text/keyword fields
+                log.debug("Empty object for text field, converting to empty string");
+                return RepairOutcome.repaired("", "EMPTY_OBJECT_TO_EMPTY_STRING");
+            }
+        }
         try {
             String json = mapper.writeValueAsString(value);
             return RepairOutcome.repaired(json, "OBJECT_SERIALIZED_TO_" + esType.toUpperCase());
@@ -442,14 +450,20 @@ public class DocumentRepairer {
     private RepairOutcome repairObject(String fieldName, Object value, String esType) {
         if (value == null) return RepairOutcome.valid();
         if (value instanceof Map) {
-            // Check if the map is empty - this might indicate a type mismatch
             Map<?, ?> mapValue = (Map<?, ?>) value;
             if (mapValue.isEmpty()) {
-                return RepairOutcome.unconvertible("Empty object provided for field '" + fieldName + "' of type " + esType);
+                // Empty object - try to convert to null (removes the field) or empty string
+                log.debug("Empty object for field '{}' of type {}, converting to null", fieldName, esType);
+                return RepairOutcome.repaired(null, "EMPTY_OBJECT_TO_NULL");
             }
             return RepairOutcome.valid();
         }
         // Concrete value (string, number, etc.) where object is expected
+        // Try to convert it to an object via the array-to-object conversion logic
+        RepairOutcome conversionOutcome = tryArrayToObjectConversion(fieldName, value, esType, 0);
+        if (conversionOutcome.getStatus() == RepairOutcome.Status.REPAIRED) {
+            return conversionOutcome;
+        }
         return RepairOutcome.unconvertible("Expected object for field '" + fieldName + "' but found " + value.getClass().getSimpleName() + " value: " + value);
     }
 
