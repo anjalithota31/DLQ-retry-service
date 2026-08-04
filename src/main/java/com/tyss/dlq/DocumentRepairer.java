@@ -84,6 +84,17 @@ public class DocumentRepairer {
 
             if (fieldValue == null) continue; // null is valid for any ES type
 
+            // Special check: if ES expects object/nested but value is not a Map, mark as unconvertible
+            if (("object".equals(esType) || "nested".equals(esType)) && !(fieldValue instanceof Map)) {
+                repairedDoc.remove(fieldName);
+                unconvertibleFields.put(fieldName, new RepairResult.UnconvertibleField(
+                        toRawString(fieldValue), esType, 
+                        "Expected object for field '" + fieldName + "' but found " + fieldValue.getClass().getSimpleName() + " value: " + fieldValue));
+                log.warn("Unconvertible field '{}' (esType={}): kept as string in raw index. reason='Expected object but found {}'",
+                        fieldName, esType, fieldValue.getClass().getSimpleName());
+                continue;
+            }
+
             RepairOutcome outcome = repairField(fieldName, fieldValue, esType);
 
             switch (outcome.getStatus()) {
@@ -190,6 +201,17 @@ public class DocumentRepairer {
                     String nestedEsType = (String) nestedFieldMapping.getOrDefault("type", "object");
 
                     if (nestedFieldValue == null) continue; // null is valid for any ES type
+
+                    // Special check: if ES expects object/nested but value is not a Map, mark as unconvertible
+                    if (("object".equals(nestedEsType) || "nested".equals(nestedEsType)) && !(nestedFieldValue instanceof Map)) {
+                        fieldValueMap.remove(nestedFieldName);
+                        unconvertibleFields.put(nestedFullPath, new RepairResult.UnconvertibleField(
+                                toRawString(nestedFieldValue), nestedEsType, 
+                                "Expected object for field '" + nestedFullPath + "' but found " + nestedFieldValue.getClass().getSimpleName() + " value: " + nestedFieldValue));
+                        log.warn("Unconvertible nested field '{}' (esType={}): kept as string in raw index. reason='Expected object but found {}'",
+                                nestedFullPath, nestedEsType, nestedFieldValue.getClass().getSimpleName());
+                        continue;
+                    }
 
                     RepairOutcome outcome = repairField(nestedFullPath, nestedFieldValue, nestedEsType);
 
