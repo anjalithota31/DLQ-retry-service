@@ -102,8 +102,15 @@ public class DlqRepairApplication {
         // Retry configuration
         int maxRetries = Integer.parseInt(getConfig.apply("max.retries"));
         if (maxRetries == 0) maxRetries = 3;
+        final int maxConversionRetries = Integer.parseInt(getConfig.apply("max.conversion.retries")) == 0 ? 3 : Integer.parseInt(getConfig.apply("max.conversion.retries"));
         long retryBackoffMs = Long.parseLong(getConfig.apply("retry.backoff.ms"));
         if (retryBackoffMs == 0) retryBackoffMs = 100;
+        
+        // Kafka connection retry configuration
+        int kafkaConnectionMaxRetries = Integer.parseInt(getConfig.apply("kafka.connection.max.retries"));
+        if (kafkaConnectionMaxRetries == 0) kafkaConnectionMaxRetries = 5;
+        long kafkaConnectionRetryBackoffMs = Long.parseLong(getConfig.apply("kafka.connection.retry.backoff.ms"));
+        if (kafkaConnectionRetryBackoffMs == 0) kafkaConnectionRetryBackoffMs = 2000;
         
         // Circuit breaker configuration
         int circuitBreakerThreshold = Integer.parseInt(
@@ -167,7 +174,7 @@ public class DlqRepairApplication {
         // Update health check with circuit breaker status
         healthCheckServer.setHealthMessage("Service initialized, circuit breaker: " + circuitBreaker.getState());
 
-        KafkaConsumer<String, String> consumer = buildConsumer(appConfig);
+        KafkaConsumer<String, String> consumer = buildConsumerWithRetry(appConfig, kafkaConnectionMaxRetries, kafkaConnectionRetryBackoffMs);
 
         System.out.println("====================================");
         System.out.println("Consumer created");
@@ -369,7 +376,7 @@ consumer.seekToBeginning(consumer.assignment());
                 futures.add(threadPool.submit(() -> {
                     try {
                         processIndexBatch(indexTarget, indexRecords, mapper, mappingCache, 
-                                indexer, finalFailedIndex, metrics);
+                                indexer, finalFailedIndex, metrics, maxConversionRetries);
                     } catch (Exception e) {
                         log.error("Error processing batch for index '{}'", indexTarget, e);
                         throw new RuntimeException(e);
@@ -564,13 +571,14 @@ consumer.seekToBeginning(consumer.assignment());
                                           MappingCache mappingCache,
                                           ElasticsearchIndexer indexer,
                                           String failedIndex,
-                                          MetricsCollector metrics) {
+                                          MetricsCollector metrics,
+                                          int maxConversionRetries) {
         
         log.info("Starting batch processing for index '{}'. Total records: {}", targetIndex, records.size());
         
         // Get mapping for this index
         Map<String, Object> mapping = mappingCache.getMapping(targetIndex);
-        DocumentRepairer indexRepairer = new DocumentRepairer(mapping, mapper);
+        DocumentRepairer indexRepairer = new DocumentRepairer(mapping, mapper, maxConversionRetries);
         
         List<ElasticsearchIndexer.BulkEntry> targetBatch = new ArrayList<>();
         List<ElasticsearchIndexer.FailureEntry> failureBatch = new ArrayList<>();
@@ -879,6 +887,41 @@ consumer.seekToBeginning(consumer.assignment());
             throw new IllegalArgumentException(
                     "Invalid Elasticsearch URL: " + esUrl, e);
         }
+    }
+
+    private static KafkaConsumer<String, String> buildConsumerWithRetry(Properties appConfig, int maxRetries, long initialBackoffMs) {
+        int attempt = 0;
+        Exception lastException = null;
+        
+        while (attempt <= maxRetries) {
+            try {
+                log.info("Attempting to connect to Kafka (attempt {}/{})", attempt + 1, maxRetries + 1);
+                KafkaConsumer<String, String> consumer = buildConsumer(appConfig);
+                
+                // Test the connection by listing topics
+                consumer.listTopics();
+                log.info("Successfully connected to Kafka on attempt {}", attempt + 1);
+                return consumer;
+                
+            } catch (Exception e) {
+                lastException = e;
+                log.warn("Kafka connection attempt {} failed: {}", attempt + 1, e.getMessage());
+                
+                if (attempt < maxRetries) {
+                    long backoffMs = initialBackoffMs * (1L << attempt); // Exponential backoff
+                    log.info("Retrying Kafka connection in {}ms (exponential backoff)", backoffMs);
+                    try {
+                        Thread.sleep(backoffMs);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Interrupted while waiting to retry Kafka connection", ie);
+                    }
+                }
+                attempt++;
+            }
+        }
+        
+        throw new RuntimeException("Failed to connect to Kafka after " + (maxRetries + 1) + " attempts", lastException);
     }
 
     private static KafkaConsumer<String, String> buildConsumer(Properties appConfig) {

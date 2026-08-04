@@ -29,7 +29,10 @@ public class ConfigValidator {
         
         // Numeric properties with validation
         requirePositiveInt(config, "max.retries", "Max retries must be positive");
+        requirePositiveInt(config, "max.conversion.retries", "Max conversion retries must be positive");
+        requirePositiveInt(config, "kafka.connection.max.retries", "Kafka connection max retries must be positive");
         requirePositiveLong(config, "retry.backoff.ms", "Retry backoff must be positive");
+        requirePositiveLong(config, "kafka.connection.retry.backoff.ms", "Kafka connection retry backoff must be positive");
         requirePositiveInt(config, "circuit.breaker.failure.threshold", "Circuit breaker threshold must be positive");
         requirePositiveLong(config, "circuit.breaker.timeout.ms", "Circuit breaker timeout must be positive");
         requirePositiveInt(config, "consumer.max.poll.records", "Max poll records must be positive");
