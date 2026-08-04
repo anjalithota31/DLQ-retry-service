@@ -59,6 +59,10 @@ public class DocumentRepairer {
      */
     @SuppressWarnings("unchecked")
     public RepairResult repair(Map<String, Object> document) {
+        log.info("Starting repair for document with {} top-level fields", document.size());
+        log.debug("Document fields: {}", document.keySet());
+        log.debug("Index mapping fields: {}", indexMapping.keySet());
+        
         Map<String, Object>             repairedDoc         = new LinkedHashMap<>(document);
         List<RepairAction>               repairedFields      = new ArrayList<>();
         List<RemovedField>               removedFields       = new ArrayList<>();
@@ -92,19 +96,21 @@ public class DocumentRepairer {
 
             // Special check: if ES expects object/nested but value is not a Map, try conversion with retries
             if (("object".equals(esType) || "nested".equals(esType)) && !(fieldValue instanceof Map)) {
+                log.info("Field '{}' expects {} but has value type '{}', attempting conversion", 
+                        fieldName, esType, fieldValue.getClass().getSimpleName());
                 RepairOutcome arrayConversionOutcome = tryArrayToObjectConversion(fieldName, fieldValue, esType, 0);
                 if (arrayConversionOutcome.getStatus() == RepairOutcome.Status.REPAIRED) {
                     repairedDoc.put(fieldName, arrayConversionOutcome.getRepairedValue());
                     repairedFields.add(new RepairAction(fieldName, esType,
                             toRawString(fieldValue), String.valueOf(arrayConversionOutcome.getRepairedValue()),
                             arrayConversionOutcome.getStrategy()));
-                    log.debug("Converted array to object for field '{}': strategy={}", fieldName, arrayConversionOutcome.getStrategy());
+                    log.info("Converted field '{}' to object: strategy={}", fieldName, arrayConversionOutcome.getStrategy());
                     continue;
                 } else if (arrayConversionOutcome.getStatus() == RepairOutcome.Status.UNCONVERTIBLE) {
                     repairedDoc.remove(fieldName);
                     unconvertibleFields.put(fieldName, new RepairResult.UnconvertibleField(
                             toRawString(fieldValue), esType, arrayConversionOutcome.getReason()));
-                    log.warn("Unconvertible field '{}' (esType={}): kept as string in raw index. reason='{}'",
+                    log.warn("Unconvertible field '{}' (esType={}): reason='{}'",
                             fieldName, esType, arrayConversionOutcome.getReason());
                     continue;
                 }
@@ -220,19 +226,21 @@ public class DocumentRepairer {
 
                     // Special check: if ES expects object/nested but value is not a Map, try conversion with retries
                     if (("object".equals(nestedEsType) || "nested".equals(nestedEsType)) && !(nestedFieldValue instanceof Map)) {
+                        log.info("Nested field '{}' expects {} but has value type '{}', attempting conversion", 
+                                nestedFullPath, nestedEsType, nestedFieldValue.getClass().getSimpleName());
                         RepairOutcome arrayConversionOutcome = tryArrayToObjectConversion(nestedFullPath, nestedFieldValue, nestedEsType, 0);
                         if (arrayConversionOutcome.getStatus() == RepairOutcome.Status.REPAIRED) {
                             fieldValueMap.put(nestedFieldName, arrayConversionOutcome.getRepairedValue());
                             repairedFields.add(new RepairAction(nestedFullPath, nestedEsType,
                                     toRawString(nestedFieldValue), String.valueOf(arrayConversionOutcome.getRepairedValue()),
                                     arrayConversionOutcome.getStrategy()));
-                            log.debug("Converted array to object for nested field '{}': strategy={}", nestedFullPath, arrayConversionOutcome.getStrategy());
+                            log.info("Converted nested field '{}' to object: strategy={}", nestedFullPath, arrayConversionOutcome.getStrategy());
                             continue;
                         } else if (arrayConversionOutcome.getStatus() == RepairOutcome.Status.UNCONVERTIBLE) {
                             fieldValueMap.remove(nestedFieldName);
                             unconvertibleFields.put(nestedFullPath, new RepairResult.UnconvertibleField(
                                     toRawString(nestedFieldValue), nestedEsType, arrayConversionOutcome.getReason()));
-                            log.warn("Unconvertible nested field '{}' (esType={}): kept as string in raw index. reason='{}'",
+                            log.warn("Unconvertible nested field '{}' (esType={}): reason='{}'",
                                     nestedFullPath, nestedEsType, arrayConversionOutcome.getReason());
                             continue;
                         }

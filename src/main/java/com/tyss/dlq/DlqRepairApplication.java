@@ -688,7 +688,10 @@ consumer.seekToBeginning(consumer.assignment());
         
         for (String failedId : failedIdsWithReasons.keySet()) {
             PendingRecord pending = pendingById.get(failedId);
-            if (pending == null) continue;
+            if (pending == null) {
+                log.warn("Pending record not found for failed id={}", failedId);
+                continue;
+            }
             String actualReason = failedIdsWithReasons.get(failedId);
             log.error("ES indexing failed after repair. id={}, reason={}", failedId, actualReason);
             
@@ -701,10 +704,16 @@ consumer.seekToBeginning(consumer.assignment());
                 // Remove the problematic field from the document and retry
                 @SuppressWarnings("unchecked")
                 Map<String, Object> docForRetry = new LinkedHashMap<>(pending.targetDoc);
+                log.debug("Document before field removal: {}", docForRetry.keySet());
+                
                 boolean removed = removeNestedField(docForRetry, problematicField);
                 
+                log.debug("Document after field removal (removed={}): {}, remaining fields: {}", 
+                        removed, docForRetry.isEmpty() ? "empty" : "not empty", docForRetry.keySet());
+                
                 if (removed && !docForRetry.isEmpty()) {
-                    log.info("Removed problematic field '{}' from document id={}, retrying indexing", problematicField, failedId);
+                    log.info("Removed problematic field '{}' from document id={}, retrying indexing with {} remaining fields", 
+                            problematicField, failedId, docForRetry.size());
                     retryBatch.add(new ElasticsearchIndexer.BulkEntry(failedId, docForRetry));
                     
                     // Track the removed field for failure documentation
@@ -730,12 +739,19 @@ consumer.seekToBeginning(consumer.assignment());
                     }
                     continue;
                 } else {
-                    log.warn("Could not remove field '{}' or document became empty for id={}", problematicField, failedId);
+                    if (!removed) {
+                        log.warn("Could not remove field '{}' from document id={}", problematicField, failedId);
+                    }
+                    if (docForRetry.isEmpty()) {
+                        log.warn("Document became empty after removing field '{}' for id={}", problematicField, failedId);
+                    }
                 }
+            } else {
+                log.warn("Could not identify problematic field from ES error for id={}", failedId);
             }
             
             // If we couldn't identify/remove the problematic field, treat as permanent failure
-            log.warn("Could not identify problematic field from ES error for id={}, treating as permanent failure", failedId);
+            log.warn("Treating as permanent failure for id={}", failedId);
             
             // Build problematicFields map from repair result
             Map<String, String> problematicFields = new LinkedHashMap<>();
@@ -1026,12 +1042,15 @@ consumer.seekToBeginning(consumer.assignment());
         
         while (matcher.find()) {
             String field = matcher.group(1);
-            // Return the first field that looks like a field path (contains dots or is a reasonable field name)
-            if (field.contains(".") || !field.contains(" ")) {
+            // Return the first field that looks like a field path (contains dots)
+            // Also accept fields that might have spaces in them (e.g., "Assign to")
+            if (field.contains(".") || field.matches(".*[a-zA-Z].*")) {
+                log.debug("Extracted field '{}' from ES error: {}", field, esError);
                 return field;
             }
         }
         
+        log.warn("Could not extract field from ES error: {}", esError);
         return null;
     }
 
