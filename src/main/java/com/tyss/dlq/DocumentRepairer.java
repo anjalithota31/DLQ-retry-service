@@ -351,12 +351,21 @@ public class DocumentRepairer {
             // Try common patterns: dd/MM/yyyy, MM-dd-yyyy, etc.
             String[] patterns = {"dd/MM/yyyy", "MM/dd/yyyy", "yyyy/MM/dd",
                                  "dd-MM-yyyy", "MM-dd-yyyy",
-                                 "dd MMM yyyy", "MMM dd yyyy"};
+                                 "dd MMM yyyy", "MMM dd yyyy",
+                                 "dd-MM-yyyy HH:mm", "dd/MM/yyyy HH:mm"};
             for (String pattern : patterns) {
                 try {
-                    LocalDate parsed = LocalDate.parse(s, DateTimeFormatter.ofPattern(pattern));
-                    String iso = parsed.format(DateTimeFormatter.ISO_LOCAL_DATE);
-                    return RepairOutcome.repaired(iso, "DATE_FORMAT_NORMALIZED");
+                    if (pattern.contains("HH:mm")) {
+                        // Parse with time
+                        LocalDateTime parsed = LocalDateTime.parse(s, DateTimeFormatter.ofPattern(pattern));
+                        String iso = parsed.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME);
+                        return RepairOutcome.repaired(iso, "DATE_FORMAT_NORMALIZED");
+                    } else {
+                        // Parse date only
+                        LocalDate parsed = LocalDate.parse(s, DateTimeFormatter.ofPattern(pattern));
+                        String iso = parsed.format(DateTimeFormatter.ISO_LOCAL_DATE);
+                        return RepairOutcome.repaired(iso, "DATE_FORMAT_NORMALIZED");
+                    }
                 } catch (DateTimeParseException ignored) {}
             }
             return RepairOutcome.unconvertible("Cannot parse '" + s + "' as a date");

@@ -684,7 +684,7 @@ consumer.seekToBeginning(consumer.assignment());
         // Phase 5: Handle ES indexing failures by removing problematic fields and retrying
         log.info("Phase 5: ES indexing failures to handle with field removal and retry: {}", failedIdsWithReasons.size());
         List<ElasticsearchIndexer.FailureEntry> permanentFailures = new ArrayList<>();
-        List<ElasticsearchIndexer.BulkEntry> retryBatch = new ArrayList<>();
+        int maxFieldRemovalRetries = 5; // Max number of fields to remove per document
         
         for (String failedId : failedIdsWithReasons.keySet()) {
             PendingRecord pending = pendingById.get(failedId);
@@ -692,127 +692,112 @@ consumer.seekToBeginning(consumer.assignment());
                 log.warn("Pending record not found for failed id={}", failedId);
                 continue;
             }
-            String actualReason = failedIdsWithReasons.get(failedId);
-            log.error("ES indexing failed after repair. id={}, reason={}", failedId, actualReason);
             
-            // Try to extract the problematic field from ES error message
-            String problematicField = extractProblematicFieldFromEsError(actualReason);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> docForRetry = new LinkedHashMap<>(pending.targetDoc);
+            Map<String, String> allRemovedFields = new LinkedHashMap<>();
+            boolean successfullyIndexed = false;
             
-            if (problematicField != null) {
+            // Loop to keep removing problematic fields and retrying
+            for (int retryAttempt = 0; retryAttempt < maxFieldRemovalRetries; retryAttempt++) {
+                String actualReason = failedIdsWithReasons.get(failedId);
+                log.error("ES indexing failed (attempt {}) for id={}, reason={}", retryAttempt + 1, failedId, actualReason);
+                
+                // Try to extract the problematic field from ES error message
+                String problematicField = extractProblematicFieldFromEsError(actualReason);
+                
+                if (problematicField == null) {
+                    log.warn("Could not identify problematic field from ES error for id={}, stopping retry loop", failedId);
+                    break;
+                }
+                
                 log.info("Identified problematic field '{}' from ES error for id={}", problematicField, failedId);
                 
-                // Remove the problematic field from the document and retry
-                @SuppressWarnings("unchecked")
-                Map<String, Object> docForRetry = new LinkedHashMap<>(pending.targetDoc);
-                log.debug("Document before field removal: {}", docForRetry.keySet());
-                
+                // Remove the problematic field from the document
                 boolean removed = removeNestedField(docForRetry, problematicField);
                 
-                log.debug("Document after field removal (removed={}): {}, remaining fields: {}", 
-                        removed, docForRetry.isEmpty() ? "empty" : "not empty", docForRetry.keySet());
+                if (!removed) {
+                    log.warn("Could not remove field '{}' from document id={}, stopping retry loop", problematicField, failedId);
+                    break;
+                }
                 
-                if (removed && !docForRetry.isEmpty()) {
-                    log.info("Removed problematic field '{}' from document id={}, retrying indexing with {} remaining fields", 
-                            problematicField, failedId, docForRetry.size());
-                    retryBatch.add(new ElasticsearchIndexer.BulkEntry(failedId, docForRetry));
-                    
-                    // Track the removed field for failure documentation
-                    Map<String, String> problematicFields = new LinkedHashMap<>();
-                    problematicFields.put(problematicField, actualReason);
-                    
-                    try {
-                        @SuppressWarnings("unchecked")
-                        Map<String, Object> originalDoc = mapper.readValue(pending.record.value(), Map.class);
-                        String originalDocJson = mapper.writeValueAsString(originalDoc);
-                        FailedDocument failedDoc = new FailedDocument(targetIndex, failedId, 
-                                "Field removed due to ES error: " + actualReason, 
-                                problematicFields, actualReason, originalDocJson);
-                        permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
-                                failedId, mapper.convertValue(failedDoc, Map.class)));
-                    } catch (Exception e) {
-                        log.error("Failed to parse original document for failure tracking. id={}", failedId, e);
-                        FailedDocument failedDoc = new FailedDocument(targetIndex, failedId, 
-                                "Field removed due to ES error: " + actualReason, 
-                                problematicFields);
-                        permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
-                                failedId, mapper.convertValue(failedDoc, Map.class)));
-                    }
-                    continue;
+                allRemovedFields.put(problematicField, actualReason);
+                log.info("Removed problematic field '{}' from document id={}, remaining fields: {}", 
+                        problematicField, failedId, docForRetry.size());
+                
+                if (docForRetry.isEmpty()) {
+                    log.warn("Document became empty after removing field '{}' for id={}", problematicField, failedId);
+                    break;
+                }
+                
+                // Retry indexing with the cleaned document
+                List<ElasticsearchIndexer.BulkEntry> singleRetryBatch = new ArrayList<>();
+                singleRetryBatch.add(new ElasticsearchIndexer.BulkEntry(failedId, docForRetry));
+                
+                log.info("Retrying indexing for id={} after removing field '{}' (attempt {}/{})", 
+                        failedId, problematicField, retryAttempt + 1, maxFieldRemovalRetries);
+                
+                Map<String, String> retryResult = indexer.bulkIndex(targetIndex, singleRetryBatch);
+                
+                if (retryResult.isEmpty()) {
+                    log.info("Successfully indexed document id={} after removing {} field(s)", 
+                            failedId, allRemovedFields.size());
+                    successfullyIndexed = true;
+                    break; // Success, exit retry loop
                 } else {
-                    if (!removed) {
-                        log.warn("Could not remove field '{}' from document id={}", problematicField, failedId);
-                    }
-                    if (docForRetry.isEmpty()) {
-                        log.warn("Document became empty after removing field '{}' for id={}", problematicField, failedId);
+                    // Update the actual reason for the next iteration
+                    String newReason = retryResult.get(failedId);
+                    if (newReason != null) {
+                        failedIdsWithReasons.put(failedId, newReason);
+                        log.warn("Retry failed for id={}, new error: {}", failedId, newReason);
                     }
                 }
+            }
+            
+            if (successfullyIndexed) {
+                // Track the removed fields for failure documentation
+                try {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> originalDoc = mapper.readValue(pending.record.value(), Map.class);
+                    String originalDocJson = mapper.writeValueAsString(originalDoc);
+                    FailedDocument failedDoc = new FailedDocument(targetIndex, failedId, 
+                            "Successfully indexed after removing " + allRemovedFields.size() + " problematic field(s)", 
+                            allRemovedFields, null, originalDocJson);
+                    permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
+                            failedId, mapper.convertValue(failedDoc, Map.class)));
+                } catch (Exception e) {
+                    log.error("Failed to parse original document for success tracking. id={}", failedId, e);
+                }
             } else {
-                log.warn("Could not identify problematic field from ES error for id={}", failedId);
-            }
-            
-            // If we couldn't identify/remove the problematic field, treat as permanent failure
-            log.warn("Treating as permanent failure for id={}", failedId);
-            
-            // Build problematicFields map from repair result
-            Map<String, String> problematicFields = new LinkedHashMap<>();
-            if (pending.repairResult != null && !pending.repairResult.getUnconvertibleFields().isEmpty()) {
-                pending.repairResult.getUnconvertibleFields().forEach((fieldName, unconvertibleField) -> 
-                    problematicFields.put(fieldName, unconvertibleField.getReason()));
-            }
-            
-            // Include original document for debugging
-            try {
-                @SuppressWarnings("unchecked")
-                Map<String, Object> originalDoc = mapper.readValue(pending.record.value(), Map.class);
-                String originalDocJson = mapper.writeValueAsString(originalDoc);
-                FailedDocument failedDoc = new FailedDocument(targetIndex, failedId, actualReason, 
-                        problematicFields, actualReason, originalDocJson);
-                permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
-                        failedId, mapper.convertValue(failedDoc, Map.class)));
-            } catch (Exception e) {
-                log.error("Failed to parse original document for permanent failure tracking. id={}", failedId, e);
-                // Fallback without original document but with problematicFields
-                FailedDocument failedDoc = new FailedDocument(targetIndex, failedId, actualReason, 
-                        problematicFields);
-                permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
-                        failedId, mapper.convertValue(failedDoc, Map.class)));
-            }
-        }
-        
-        // Retry indexing documents with problematic fields removed
-        if (!retryBatch.isEmpty()) {
-            log.info("Retrying indexing for {} documents after removing problematic fields", retryBatch.size());
-            Map<String, String> retryFailedIds = indexer.bulkIndex(targetIndex, retryBatch);
-            
-            if (retryFailedIds.isEmpty()) {
-                log.info("Successfully indexed {} documents after field removal", retryBatch.size());
-                metrics.incrementRecordsSucceeded(retryBatch.size());
-            } else {
-                log.warn("Retry failed for {} documents after field removal", retryFailedIds.size());
-                metrics.incrementRecordsFailed(retryFailedIds.size());
+                // Document still failed after max retries, treat as permanent failure
+                log.warn("Document id={} failed after {} field removal attempts, treating as permanent failure", 
+                        failedId, maxFieldRemovalRetries);
                 
-                // Add retry failures to permanent failures
-                for (String retryFailedId : retryFailedIds.keySet()) {
-                    PendingRecord pending = pendingById.get(retryFailedId);
-                    if (pending != null) {
-                        Map<String, String> problematicFields = new LinkedHashMap<>();
-                        problematicFields.put("multiple_fields_failed", "Document failed even after removing identified problematic field");
-                        try {
-                            @SuppressWarnings("unchecked")
-                            Map<String, Object> originalDoc = mapper.readValue(pending.record.value(), Map.class);
-                            String originalDocJson = mapper.writeValueAsString(originalDoc);
-                            FailedDocument failedDoc = new FailedDocument(targetIndex, retryFailedId, 
-                                    retryFailedIds.get(retryFailedId), 
-                                    problematicFields, retryFailedIds.get(retryFailedId), originalDocJson);
-                            permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
-                                    retryFailedId, mapper.convertValue(failedDoc, Map.class)));
-                        } catch (Exception e) {
-                            FailedDocument failedDoc = new FailedDocument(targetIndex, retryFailedId, 
-                                    retryFailedIds.get(retryFailedId), problematicFields);
-                            permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
-                                    retryFailedId, mapper.convertValue(failedDoc, Map.class)));
-                        }
-                    }
+                // Build problematicFields map from repair result + removed fields
+                Map<String, String> problematicFields = new LinkedHashMap<>();
+                if (pending.repairResult != null && !pending.repairResult.getUnconvertibleFields().isEmpty()) {
+                    pending.repairResult.getUnconvertibleFields().forEach((fieldName, unconvertibleField) -> 
+                        problematicFields.put(fieldName, unconvertibleField.getReason()));
+                }
+                problematicFields.putAll(allRemovedFields);
+                
+                // Include original document for debugging
+                try {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> originalDoc = mapper.readValue(pending.record.value(), Map.class);
+                    String originalDocJson = mapper.writeValueAsString(originalDoc);
+                    FailedDocument failedDoc = new FailedDocument(targetIndex, failedId, 
+                            failedIdsWithReasons.get(failedId), 
+                            problematicFields, failedIdsWithReasons.get(failedId), originalDocJson);
+                    permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
+                            failedId, mapper.convertValue(failedDoc, Map.class)));
+                } catch (Exception e) {
+                    log.error("Failed to parse original document for permanent failure tracking. id={}", failedId, e);
+                    // Fallback without original document but with problematicFields
+                    FailedDocument failedDoc = new FailedDocument(targetIndex, failedId, 
+                            failedIdsWithReasons.get(failedId), problematicFields);
+                    permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
+                            failedId, mapper.convertValue(failedDoc, Map.class)));
                 }
             }
         }
