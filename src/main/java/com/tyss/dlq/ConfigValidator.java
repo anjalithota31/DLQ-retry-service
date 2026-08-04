@@ -26,6 +26,7 @@ public class ConfigValidator {
         }
         requireNonEmpty(config, "elasticsearch.url", "Elasticsearch URL must be specified");
         requireNonEmpty(config, "kafka.bootstrap.servers", "Kafka bootstrap servers must be specified");
+        requireNonEmpty(config, "corrected.docs.index", "Corrected documents index must be specified");
         
         // Numeric properties with validation
         requirePositiveInt(config, "max.retries", "Max retries must be positive");
