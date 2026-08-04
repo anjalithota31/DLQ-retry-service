@@ -619,7 +619,7 @@ consumer.seekToBeginning(consumer.assignment());
                 }
 
                 targetBatch.add(new ElasticsearchIndexer.BulkEntry(esId, docForTargetIndex));
-                pendingById.put(esId, new PendingRecord(record, result));
+                pendingById.put(esId, new PendingRecord(record, result, docForTargetIndex));
 
             } catch (Exception e) {
                 // Malformed JSON or unexpected repair crash — store directly in failed-docs
@@ -681,14 +681,61 @@ consumer.seekToBeginning(consumer.assignment());
             log.warn("Phase 4: No unconvertible field failures to track");
         }
 
-        // Phase 5: Store permanently failed docs in dlq-failed-documents with actual ES error details
-        log.info("Phase 5: Permanent ES indexing failures to track: {}", failedIdsWithReasons.size());
+        // Phase 5: Handle ES indexing failures by removing problematic fields and retrying
+        log.info("Phase 5: ES indexing failures to handle with field removal and retry: {}", failedIdsWithReasons.size());
         List<ElasticsearchIndexer.FailureEntry> permanentFailures = new ArrayList<>();
+        List<ElasticsearchIndexer.BulkEntry> retryBatch = new ArrayList<>();
+        
         for (String failedId : failedIdsWithReasons.keySet()) {
             PendingRecord pending = pendingById.get(failedId);
             if (pending == null) continue;
             String actualReason = failedIdsWithReasons.get(failedId);
             log.error("ES indexing failed after repair. id={}, reason={}", failedId, actualReason);
+            
+            // Try to extract the problematic field from ES error message
+            String problematicField = extractProblematicFieldFromEsError(actualReason);
+            
+            if (problematicField != null) {
+                log.info("Identified problematic field '{}' from ES error for id={}", problematicField, failedId);
+                
+                // Remove the problematic field from the document and retry
+                @SuppressWarnings("unchecked")
+                Map<String, Object> docForRetry = new LinkedHashMap<>(pending.targetDoc);
+                boolean removed = removeNestedField(docForRetry, problematicField);
+                
+                if (removed && !docForRetry.isEmpty()) {
+                    log.info("Removed problematic field '{}' from document id={}, retrying indexing", problematicField, failedId);
+                    retryBatch.add(new ElasticsearchIndexer.BulkEntry(failedId, docForRetry));
+                    
+                    // Track the removed field for failure documentation
+                    Map<String, String> problematicFields = new LinkedHashMap<>();
+                    problematicFields.put(problematicField, actualReason);
+                    
+                    try {
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> originalDoc = mapper.readValue(pending.record.value(), Map.class);
+                        String originalDocJson = mapper.writeValueAsString(originalDoc);
+                        FailedDocument failedDoc = new FailedDocument(targetIndex, failedId, 
+                                "Field removed due to ES error: " + actualReason, 
+                                problematicFields, actualReason, originalDocJson);
+                        permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
+                                failedId, mapper.convertValue(failedDoc, Map.class)));
+                    } catch (Exception e) {
+                        log.error("Failed to parse original document for failure tracking. id={}", failedId, e);
+                        FailedDocument failedDoc = new FailedDocument(targetIndex, failedId, 
+                                "Field removed due to ES error: " + actualReason, 
+                                problematicFields);
+                        permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
+                                failedId, mapper.convertValue(failedDoc, Map.class)));
+                    }
+                    continue;
+                } else {
+                    log.warn("Could not remove field '{}' or document became empty for id={}", problematicField, failedId);
+                }
+            }
+            
+            // If we couldn't identify/remove the problematic field, treat as permanent failure
+            log.warn("Could not identify problematic field from ES error for id={}, treating as permanent failure", failedId);
             
             // Build problematicFields map from repair result
             Map<String, String> problematicFields = new LinkedHashMap<>();
@@ -713,6 +760,44 @@ consumer.seekToBeginning(consumer.assignment());
                         problematicFields);
                 permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
                         failedId, mapper.convertValue(failedDoc, Map.class)));
+            }
+        }
+        
+        // Retry indexing documents with problematic fields removed
+        if (!retryBatch.isEmpty()) {
+            log.info("Retrying indexing for {} documents after removing problematic fields", retryBatch.size());
+            Map<String, String> retryFailedIds = indexer.bulkIndex(targetIndex, retryBatch);
+            
+            if (retryFailedIds.isEmpty()) {
+                log.info("Successfully indexed {} documents after field removal", retryBatch.size());
+                metrics.incrementRecordsSucceeded(retryBatch.size());
+            } else {
+                log.warn("Retry failed for {} documents after field removal", retryFailedIds.size());
+                metrics.incrementRecordsFailed(retryFailedIds.size());
+                
+                // Add retry failures to permanent failures
+                for (String retryFailedId : retryFailedIds.keySet()) {
+                    PendingRecord pending = pendingById.get(retryFailedId);
+                    if (pending != null) {
+                        Map<String, String> problematicFields = new LinkedHashMap<>();
+                        problematicFields.put("multiple_fields_failed", "Document failed even after removing identified problematic field");
+                        try {
+                            @SuppressWarnings("unchecked")
+                            Map<String, Object> originalDoc = mapper.readValue(pending.record.value(), Map.class);
+                            String originalDocJson = mapper.writeValueAsString(originalDoc);
+                            FailedDocument failedDoc = new FailedDocument(targetIndex, retryFailedId, 
+                                    retryFailedIds.get(retryFailedId), 
+                                    problematicFields, retryFailedIds.get(retryFailedId), originalDocJson);
+                            permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
+                                    retryFailedId, mapper.convertValue(failedDoc, Map.class)));
+                        } catch (Exception e) {
+                            FailedDocument failedDoc = new FailedDocument(targetIndex, retryFailedId, 
+                                    retryFailedIds.get(retryFailedId), problematicFields);
+                            permanentFailures.add(new ElasticsearchIndexer.FailureEntry(
+                                    retryFailedId, mapper.convertValue(failedDoc, Map.class)));
+                        }
+                    }
+                }
             }
         }
         
@@ -758,10 +843,12 @@ consumer.seekToBeginning(consumer.assignment());
     private static class PendingRecord {
         final ConsumerRecord<String, String> record;
         final RepairResult                   repairResult;
+        final Map<String, Object>            targetDoc;
 
-        PendingRecord(ConsumerRecord<String, String> record, RepairResult repairResult) {
+        PendingRecord(ConsumerRecord<String, String> record, RepairResult repairResult, Map<String, Object> targetDoc) {
             this.record       = record;
             this.repairResult = repairResult;
+            this.targetDoc    = targetDoc;
         }
     }
 
@@ -922,6 +1009,61 @@ consumer.seekToBeginning(consumer.assignment());
         }
         
         throw new RuntimeException("Failed to connect to Kafka after " + (maxRetries + 1) + " attempts", lastException);
+    }
+
+    /**
+     * Extracts the problematic field name from an Elasticsearch error message.
+     * ES error format: "object mapping for [field.name] tried to parse field [field.name] as object, but found a concrete value"
+     */
+    private static String extractProblematicFieldFromEsError(String esError) {
+        if (esError == null || esError.isEmpty()) {
+            return null;
+        }
+        
+        // Pattern: "for [field.name]" or "field [field.name]"
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("\\[([^\\]]+)\\]");
+        java.util.regex.Matcher matcher = pattern.matcher(esError);
+        
+        while (matcher.find()) {
+            String field = matcher.group(1);
+            // Return the first field that looks like a field path (contains dots or is a reasonable field name)
+            if (field.contains(".") || !field.contains(" ")) {
+                return field;
+            }
+        }
+        
+        return null;
+    }
+
+    /**
+     * Removes a nested field from a document map.
+     * Field path format: "parent.child.grandchild"
+     */
+    private static boolean removeNestedField(Map<String, Object> document, String fieldPath) {
+        if (document == null || fieldPath == null || fieldPath.isEmpty()) {
+            return false;
+        }
+        
+        String[] parts = fieldPath.split("\\.");
+        if (parts.length == 0) {
+            return false;
+        }
+        
+        // Navigate to the parent of the target field
+        Map<String, Object> current = document;
+        for (int i = 0; i < parts.length - 1; i++) {
+            Object value = current.get(parts[i]);
+            if (value instanceof Map) {
+                current = (Map<String, Object>) value;
+            } else {
+                // Path doesn't exist or is not an object
+                return false;
+            }
+        }
+        
+        // Remove the final field
+        String lastPart = parts[parts.length - 1];
+        return current.remove(lastPart) != null;
     }
 
     private static KafkaConsumer<String, String> buildConsumer(Properties appConfig) {

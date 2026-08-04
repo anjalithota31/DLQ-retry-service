@@ -494,6 +494,15 @@ public class DocumentRepairer {
             } catch (Exception e) {
                 log.debug("Strategy 3 failed: Could not parse string to Map for field '{}'", fieldName);
             }
+            
+            // Strategy 3b: If string is not JSON, wrap it in a simple object
+            String stringValue = (String) value;
+            if (!stringValue.isEmpty()) {
+                Map<String, Object> wrapper = new LinkedHashMap<>();
+                wrapper.put("value", stringValue);
+                log.debug("Strategy 3b success: Wrapped string in object for field '{}'", fieldName);
+                return RepairOutcome.repaired(wrapper, "WRAP_STRING_IN_OBJECT");
+            }
         }
 
         // Strategy 4: Create a wrapper object with the array as a field
