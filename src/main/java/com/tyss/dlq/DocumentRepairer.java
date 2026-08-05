@@ -80,17 +80,15 @@ public class DocumentRepairer {
                 continue;
             }
 
-            if (!indexMapping.containsKey(fieldName)) {
-                // Field not in mapping - treat as unconvertible
-                repairedDoc.remove(fieldName);
-                unconvertibleFields.put(fieldName, new RepairResult.UnconvertibleField(
-                        toRawString(fieldValue), "unknown", "Field not in ES mapping"));
-                log.warn("Field '{}' not in mapping - marked as unconvertible", fieldName);
-                continue;
-            }
+            // Skip mapping check - with dynamic mapping enabled, ES will auto-create mappings for new fields
+            // Only flag fields that have actual type conversion issues, not missing mappings
+            // This maximizes document storage by letting ES handle field mapping dynamically
 
             Map<String, Object> fieldMapping = (Map<String, Object>) indexMapping.get(fieldName);
-            String esType = (String) fieldMapping.getOrDefault("type", "object");
+            String esType = "object"; // Default to object type for fields not in mapping
+            if (fieldMapping != null) {
+                esType = (String) fieldMapping.getOrDefault("type", "object");
+            }
 
             if (fieldValue == null) continue; // null is valid for any ES type
 
@@ -349,20 +347,32 @@ public class DocumentRepairer {
                 return RepairOutcome.repaired(epoch, "EPOCH_STRING_TO_LONG");
             } catch (NumberFormatException ignored) {}
             // Try common patterns: dd/MM/yyyy, MM-dd-yyyy, etc.
-            String[] patterns = {"dd/MM/yyyy", "MM/dd/yyyy", "yyyy/MM/dd",
-                                 "dd-MM-yyyy", "MM-dd-yyyy",
-                                 "dd MMM yyyy", "MMM dd yyyy",
-                                 "dd-MM-yyyy HH:mm", "dd/MM/yyyy HH:mm"};
+            // Added more patterns including dd-MM-yyyy HH:mm with timezone support
+            String[] patterns = {
+                "dd/MM/yyyy", "MM/dd/yyyy", "yyyy/MM/dd",
+                "dd-MM-yyyy", "MM-dd-yyyy",
+                "dd MMM yyyy", "MMM dd yyyy",
+                "dd-MM-yyyy HH:mm", "dd/MM/yyyy HH:mm",
+                "dd-MM-yyyy HH:mm:ss", "dd/MM/yyyy HH:mm:ss",
+                "yyyy-MM-dd HH:mm", "yyyy-MM-dd HH:mm:ss",
+                "d-M-yyyy H:mm", "d/M/yyyy H:mm",  // Single digit day/month/hour
+                "dd-MM-yyyy H:mm", "dd/MM/yyyy H:mm"  // Single digit hour
+            };
             for (String pattern : patterns) {
                 try {
-                    if (pattern.contains("HH:mm")) {
-                        // Parse with time
-                        LocalDateTime parsed = LocalDateTime.parse(s, DateTimeFormatter.ofPattern(pattern));
-                        String iso = parsed.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME);
-                        return RepairOutcome.repaired(iso, "DATE_FORMAT_NORMALIZED");
+                    if (pattern.contains("HH:mm") || pattern.contains("H:mm")) {
+                        // Parse with time - use lenient parsing for flexibility
+                        DateTimeFormatter formatter = DateTimeFormatter.ofPattern(pattern);
+                        formatter = formatter.withResolverStyle(java.time.format.ResolverStyle.LENIENT);
+                        LocalDateTime parsed = LocalDateTime.parse(s, formatter);
+                        // Convert to ISO-8601 format with timezone (UTC) - append 'Z' for UTC
+                        String iso = parsed.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME) + "Z";
+                        return RepairOutcome.repaired(iso, "DATE_FORMAT_NORMALIZED_TO_UTC");
                     } else {
-                        // Parse date only
-                        LocalDate parsed = LocalDate.parse(s, DateTimeFormatter.ofPattern(pattern));
+                        // Parse date only - use lenient parsing
+                        DateTimeFormatter formatter = DateTimeFormatter.ofPattern(pattern);
+                        formatter = formatter.withResolverStyle(java.time.format.ResolverStyle.LENIENT);
+                        LocalDate parsed = LocalDate.parse(s, formatter);
                         String iso = parsed.format(DateTimeFormatter.ISO_LOCAL_DATE);
                         return RepairOutcome.repaired(iso, "DATE_FORMAT_NORMALIZED");
                     }
@@ -422,6 +432,17 @@ public class DocumentRepairer {
         }
         if (value instanceof Number) {
             return RepairOutcome.repaired(((Number) value).intValue() != 0, "NUMERIC_TO_BOOLEAN");
+        }
+        // Handle ArrayList/List to boolean conversion
+        if (value instanceof java.util.List) {
+            java.util.List<?> list = (java.util.List<?>) value;
+            // Convert to true if list is non-empty or contains true values
+            boolean result = !list.isEmpty() && list.stream().anyMatch(item -> 
+                item instanceof Boolean ? (Boolean) item : 
+                item instanceof Number ? ((Number) item).intValue() != 0 :
+                item instanceof String && ((String) item).trim().equalsIgnoreCase("true")
+            );
+            return RepairOutcome.repaired(result, "ARRAYLIST_TO_BOOLEAN");
         }
         return RepairOutcome.unconvertible("Cannot convert " + value.getClass().getSimpleName() + " to boolean");
     }
