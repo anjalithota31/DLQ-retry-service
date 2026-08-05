@@ -397,7 +397,7 @@ consumer.seekToBeginning(consumer.assignment());
                 futures.add(threadPool.submit(() -> {
                     try {
                         processIndexBatch(indexTarget, indexRecords, mapper, mappingCache,
-                                indexer, finalFailedIndex, finalCorrectedIndex, metrics, maxConversionRetries, maxFieldRemovalRetries);
+                                indexer, finalFailedIndex, finalCorrectedIndex, metrics, maxConversionRetries, maxFieldRemovalRetries, esClient);
                     } catch (Exception e) {
                         log.error("Error processing batch for index '{}'", indexTarget, e);
                         throw new RuntimeException(e);
@@ -595,9 +595,13 @@ consumer.seekToBeginning(consumer.assignment());
                                           String correctedIndex,
                                           MetricsCollector metrics,
                                           int maxConversionRetries,
-                                          int maxFieldRemovalRetries) {
+                                          int maxFieldRemovalRetries,
+                                          ElasticsearchClient esClient) {
         
         log.info("Starting batch processing for index '{}'. Total records: {}", targetIndex, records.size());
+        
+        // Ensure target index exists before processing
+        createTargetIndexIfNeeded(esClient, targetIndex);
         
         // Get mapping for this index
         Map<String, Object> mapping = mappingCache.getMapping(targetIndex);
@@ -1291,6 +1295,36 @@ consumer.seekToBeginning(consumer.assignment());
         } catch (Exception e) {
             log.warn("Failed to create failed documents index '{}'. Will rely on auto-creation.", indexName, e);
             // Don't fail startup - ES may auto-create the index
+        }
+    }
+
+    /**
+     * Creates a target index if it doesn't exist, with dynamic mapping enabled.
+     * This ensures DLQ indexes are created for each connector.
+     */
+    private static void createTargetIndexIfNeeded(ElasticsearchClient esClient, String indexName) {
+        try {
+            // Check if index exists
+            boolean exists = esClient.indices().exists(e -> e.index(indexName)).value();
+            
+            if (exists) {
+                log.debug("Target index '{}' already exists", indexName);
+                return;
+            }
+            
+            log.info("Creating target index '{}' with dynamic mapping enabled", indexName);
+            
+            // Create index with dynamic mapping enabled to handle various document structures
+            esClient.indices().create(c -> c
+                    .index(indexName)
+                    .mappings(m -> m
+                            .dynamic(co.elastic.clients.elasticsearch._types.mapping.DynamicMapping.True)));
+            
+            log.info("Successfully created target index '{}'", indexName);
+            
+        } catch (Exception e) {
+            log.warn("Failed to create target index '{}'. Will rely on ES auto-creation during indexing.", indexName, e);
+            // Don't fail processing - ES may auto-create the index during bulk indexing
         }
     }
 }
