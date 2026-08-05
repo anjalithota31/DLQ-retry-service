@@ -208,17 +208,12 @@ public class DocumentRepairer {
                     Object nestedFieldValue = nestedEntry.getValue();
                     String nestedFullPath = fullPath + "." + nestedFieldName;
 
-                    if (!nestedProperties.containsKey(nestedFieldName)) {
-                        // Nested field not in mapping - treat as unconvertible
-                        fieldValueMap.remove(nestedFieldName);
-                        unconvertibleFields.put(nestedFullPath, new RepairResult.UnconvertibleField(
-                                toRawString(nestedFieldValue), "unknown", "Field not in ES mapping"));
-                        log.warn("Nested field '{}' not in mapping - marked as unconvertible", nestedFullPath);
-                        continue;
-                    }
-
+                    // Skip nested mapping check - let ES handle dynamic mapping for nested fields
                     Map<String, Object> nestedFieldMapping = (Map<String, Object>) nestedProperties.get(nestedFieldName);
-                    String nestedEsType = (String) nestedFieldMapping.getOrDefault("type", "object");
+                    String nestedEsType = "object"; // Default to object type for nested fields not in mapping
+                    if (nestedFieldMapping != null) {
+                        nestedEsType = (String) nestedFieldMapping.getOrDefault("type", "object");
+                    }
 
                     if (nestedFieldValue == null) continue; // null is valid for any ES type
 

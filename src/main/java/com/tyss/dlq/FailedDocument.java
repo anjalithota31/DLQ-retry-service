@@ -4,9 +4,9 @@ import java.time.Instant;
 import java.util.Map;
 
 /**
- * Failure record stored in the failed-documents index.
- * Contains indexName, _id, failure reason, problematic fields with reasons, ES error details,
- * and original document content for debugging purposes.
+ * Document status record stored in the dlq-documents-status index.
+ * Tracks all documents (SUCCESS/FAILED) with repair details, problematic fields,
+ * repaired fields, removed fields, and original document content.
  */
 public class FailedDocument {
 
@@ -15,32 +15,42 @@ public class FailedDocument {
     private final String status;
     private final String failureReason;
     private final Map<String, String> problematicFields;
+    private final Map<String, String> repairedFields;
+    private final Map<String, String> removedFields;
     private final String esErrorDetails;
-    private final String failedAt;
+    private final String processedAt;
     private final String originalDocument;
 
     public FailedDocument(String indexName, String documentId, String failureReason, Map<String, String> problematicFields) {
-        this(indexName, documentId, failureReason, problematicFields, null, null, "FAILED");
+        this(indexName, documentId, failureReason, problematicFields, null, null, null, null, "FAILED");
     }
 
     public FailedDocument(String indexName, String documentId, String failureReason, String esErrorDetails) {
-        this(indexName, documentId, failureReason, null, esErrorDetails, null, "FAILED");
+        this(indexName, documentId, failureReason, null, null, null, esErrorDetails, null, "FAILED");
     }
 
     public FailedDocument(String indexName, String documentId, String failureReason, Map<String, String> problematicFields,
                          String esErrorDetails, String originalDocument) {
-        this(indexName, documentId, failureReason, problematicFields, esErrorDetails, originalDocument, "FAILED");
+        this(indexName, documentId, failureReason, problematicFields, null, null, esErrorDetails, originalDocument, "FAILED");
     }
 
     public FailedDocument(String indexName, String documentId, String failureReason, Map<String, String> problematicFields,
+                         String esErrorDetails, String originalDocument, String status) {
+        this(indexName, documentId, failureReason, problematicFields, null, null, esErrorDetails, originalDocument, status);
+    }
+
+    public FailedDocument(String indexName, String documentId, String failureReason, Map<String, String> problematicFields,
+                         Map<String, String> repairedFields, Map<String, String> removedFields,
                          String esErrorDetails, String originalDocument, String status) {
         this.indexName         = indexName;
         this.documentId        = documentId;
         this.status            = status;
         this.failureReason     = failureReason;
         this.problematicFields = problematicFields;
+        this.repairedFields    = repairedFields;
+        this.removedFields     = removedFields;
         this.esErrorDetails    = esErrorDetails;
-        this.failedAt          = Instant.now().toString();
+        this.processedAt       = Instant.now().toString();
         this.originalDocument  = originalDocument;
     }
 
@@ -49,7 +59,9 @@ public class FailedDocument {
     public String getStatus()            { return status; }
     public String getFailureReason()     { return failureReason; }
     public Map<String, String> getProblematicFields() { return problematicFields; }
+    public Map<String, String> getRepairedFields()    { return repairedFields; }
+    public Map<String, String> getRemovedFields()     { return removedFields; }
     public String getEsErrorDetails()    { return esErrorDetails; }
-    public String getFailedAt()          { return failedAt; }
+    public String getProcessedAt()       { return processedAt; }
     public String getOriginalDocument()  { return originalDocument; }
 }

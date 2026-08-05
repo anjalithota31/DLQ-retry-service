@@ -671,45 +671,79 @@ consumer.seekToBeginning(consumer.assignment());
         log.info("Bulk index complete for index '{}'. total={}, succeeded={}, failed={}",
                 targetIndex, targetBatch.size(), targetBatch.size() - failedSet.size(), failedSet.size());
 
-        // Phase 3: Bulk index successful documents to dlq-failed-documents index for tracking
-        List<ElasticsearchIndexer.FailureEntry> successBatch = new ArrayList<>();
+        // Phase 3: Track ALL documents in dlq-documents-status with SUCCESS/FAILED status and repair details
+        List<ElasticsearchIndexer.FailureEntry> allDocumentsStatusBatch = new ArrayList<>();
+        
         for (ElasticsearchIndexer.BulkEntry entry : targetBatch) {
-            if (!failedSet.contains(entry.id)) {
-                SuccessfulDocument successDoc = new SuccessfulDocument(targetIndex, entry.id);
-                successBatch.add(new ElasticsearchIndexer.FailureEntry(
-                        entry.id, mapper.convertValue(successDoc, Map.class)));
+            PendingRecord pending = pendingById.get(entry.id);
+            if (pending == null) continue;
+            
+            String status = failedSet.contains(entry.id) ? "FAILED" : "SUCCESS";
+            String failureReason = failedSet.contains(entry.id) ? failedIdsWithReasons.get(entry.id) : null;
+            
+            // Build repaired fields map
+            Map<String, String> repairedFieldsMap = new LinkedHashMap<>();
+            if (!pending.repairResult.getRepairedFields().isEmpty()) {
+                for (RepairAction repair : pending.repairResult.getRepairedFields()) {
+                    repairedFieldsMap.put(repair.getFieldName(), repair.getStrategy());
+                }
             }
+            
+            // Build removed fields map
+            Map<String, String> removedFieldsMap = new LinkedHashMap<>();
+            if (!pending.repairResult.getRemovedFields().isEmpty()) {
+                for (RemovedField removed : pending.repairResult.getRemovedFields()) {
+                    removedFieldsMap.put(removed.getFieldName(), removed.getReason());
+                }
+            }
+            
+            // Build problematic fields map
+            Map<String, String> problematicFieldsMap = new LinkedHashMap<>();
+            if (!pending.repairResult.getUnconvertibleFields().isEmpty()) {
+                pending.repairResult.getUnconvertibleFields().forEach((fieldName, unconvertibleField) -> 
+                    problematicFieldsMap.put(fieldName, unconvertibleField.getReason()));
+            }
+            
+            // Get original document
+            String originalDocJson = null;
+            try {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> originalDoc = mapper.readValue(pending.record.value(), Map.class);
+                originalDocJson = mapper.writeValueAsString(originalDoc);
+            } catch (Exception e) {
+                log.warn("Failed to serialize original document for tracking: {}", entry.id);
+            }
+            
+            // Create status document
+            FailedDocument statusDoc = new FailedDocument(
+                targetIndex,
+                entry.id,
+                failureReason,
+                problematicFieldsMap,
+                repairedFieldsMap,
+                removedFieldsMap,
+                status.equals("FAILED") ? failedIdsWithReasons.get(entry.id) : null,
+                originalDocJson,
+                status
+            );
+            
+            allDocumentsStatusBatch.add(new ElasticsearchIndexer.FailureEntry(
+                entry.id, mapper.convertValue(statusDoc, Map.class)));
         }
-
-        log.info("Phase 3: Successful documents to track: {}", successBatch.size());
-        if (!successBatch.isEmpty()) {
-            List<String> failedSuccessDocs = indexer.bulkIndexFailures(failedIndex, successBatch);
-            if (failedSuccessDocs.isEmpty()) {
-                log.info("Bulk indexed {} successful documents to '{}' for tracking", successBatch.size(), failedIndex);
+        
+        log.info("Phase 3: Total documents to track in dlq-documents-status: {}", allDocumentsStatusBatch.size());
+        if (!allDocumentsStatusBatch.isEmpty()) {
+            List<String> failedStatusDocs = indexer.bulkIndexFailures(failedIndex, allDocumentsStatusBatch);
+            if (failedStatusDocs.isEmpty()) {
+                log.info("Bulk indexed {} document status records to '{}'", allDocumentsStatusBatch.size(), failedIndex);
             } else {
-                log.error("Failed to index {} successful documents to '{}': {}", failedSuccessDocs.size(), failedIndex, failedSuccessDocs);
-                metrics.incrementRecordsFailed(failedSuccessDocs.size());
-                metrics.incrementFailedDocsIndexFailures(failedSuccessDocs.size());
-                logToFallbackFile("success_tracking_failed", targetIndex, failedSuccessDocs, mapper);
+                log.error("Failed to index {} document status records to '{}': {}", failedStatusDocs.size(), failedIndex, failedStatusDocs);
+                metrics.incrementRecordsFailed(failedStatusDocs.size());
+                metrics.incrementFailedDocsIndexFailures(failedStatusDocs.size());
+                logToFallbackFile("status_tracking_failed", targetIndex, failedStatusDocs, mapper);
             }
         } else {
-            log.warn("Phase 3: No successful documents to track");
-        }
-
-        // Phase 4: Bulk index unconvertible field failures to failed-docs index
-        log.info("Phase 4: Unconvertible field failures to track: {}", failureBatch.size());
-        if (!failureBatch.isEmpty()) {
-            List<String> failedUnconvertibleDocs = indexer.bulkIndexFailures(failedIndex, failureBatch);
-            if (failedUnconvertibleDocs.isEmpty()) {
-                log.info("Bulk indexed {} unconvertible field failures to '{}'", failureBatch.size(), failedIndex);
-            } else {
-                log.error("Failed to index {} unconvertible field failures to '{}': {}", failedUnconvertibleDocs.size(), failedIndex, failedUnconvertibleDocs);
-                metrics.incrementRecordsFailed(failedUnconvertibleDocs.size());
-                metrics.incrementFailedDocsIndexFailures(failedUnconvertibleDocs.size());
-                logToFallbackFile("unconvertible_tracking_failed", targetIndex, failedUnconvertibleDocs, mapper);
-            }
-        } else {
-            log.warn("Phase 4: No unconvertible field failures to track");
+            log.warn("Phase 3: No documents to track");
         }
 
         // Phase 5: Handle ES indexing failures by removing problematic fields and retrying
@@ -869,9 +903,10 @@ consumer.seekToBeginning(consumer.assignment());
         }
         
         // Summary log for batch processing
-        int totalStoredInFailedIndex = successBatch.size() + failureBatch.size() + permanentFailures.size() + parseFailureCount;
-        log.info("Batch processing summary for index '{}': Input records={}, Stored in failed-docs index={} (Success={}, Unconvertible={}, Permanent ES failures={}, Parse failures={}), Stored in corrected-docs index={}",
-                targetIndex, records.size(), totalStoredInFailedIndex, successBatch.size(), failureBatch.size(), permanentFailures.size(), parseFailureCount, correctedDocs.size());
+        int totalStoredInStatusIndex = allDocumentsStatusBatch.size() + permanentFailures.size() + parseFailureCount;
+        log.info("Batch processing summary for index '{}': Input records={}, Stored in status index={} (Success={}, Failed={}, Permanent ES failures={}, Parse failures={}), Stored in corrected-docs index={}",
+                targetIndex, records.size(), totalStoredInStatusIndex, 
+                targetBatch.size() - failedSet.size(), failedSet.size(), permanentFailures.size(), parseFailureCount, correctedDocs.size());
     }
     
     /**
@@ -1270,13 +1305,13 @@ consumer.seekToBeginning(consumer.assignment());
             boolean exists = esClient.indices().exists(e -> e.index(indexName)).value();
             
             if (exists) {
-                log.info("Failed documents index '{}' already exists", indexName);
+                log.info("Document status index '{}' already exists", indexName);
                 return;
             }
             
-            log.info("Creating failed documents index '{}' with mappings", indexName);
+            log.info("Creating document status index '{}' with enhanced mappings", indexName);
             
-            // Create index with mappings for FailedDocument structure
+            // Create index with mappings for tracking all document statuses (SUCCESS/FAILED)
             esClient.indices().create(c -> c
                     .index(indexName)
                     .mappings(m -> m
@@ -1285,15 +1320,16 @@ consumer.seekToBeginning(consumer.assignment());
                             .properties("status", p -> p.keyword(k -> k))
                             .properties("failureReason", p -> p.text(t -> t))
                             .properties("problematicFields", p -> p.object(o -> o.dynamic(co.elastic.clients.elasticsearch._types.mapping.DynamicMapping.True)))
+                            .properties("repairedFields", p -> p.object(o -> o.dynamic(co.elastic.clients.elasticsearch._types.mapping.DynamicMapping.True)))
+                            .properties("removedFields", p -> p.object(o -> o.dynamic(co.elastic.clients.elasticsearch._types.mapping.DynamicMapping.True)))
                             .properties("esErrorDetails", p -> p.text(t -> t))
-                            .properties("failedAt", p -> p.date(d -> d))
-                            .properties("originalDocument", p -> p.text(t -> t))
-                            .properties("succeededAt", p -> p.date(d -> d))));
+                            .properties("processedAt", p -> p.date(d -> d))
+                            .properties("originalDocument", p -> p.text(t -> t))));
             
-            log.info("Successfully created failed documents index '{}'", indexName);
+            log.info("Successfully created document status index '{}'", indexName);
             
         } catch (Exception e) {
-            log.warn("Failed to create failed documents index '{}'. Will rely on auto-creation.", indexName, e);
+            log.warn("Failed to create document status index '{}'. Will rely on auto-creation.", indexName, e);
             // Don't fail startup - ES may auto-create the index
         }
     }
