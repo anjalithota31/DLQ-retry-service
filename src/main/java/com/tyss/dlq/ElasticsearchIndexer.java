@@ -234,22 +234,34 @@ public class ElasticsearchIndexer {
 
                 if (response.errors()) {
                     final int attemptFinal=attempt;
+                    final boolean[] fieldLimitErrorDetected = {false};
                     response.items().forEach(item -> {
                         if (item.error() != null) {
-                            if (isTransientFailure(item.status())) {
+                            String reason = item.error().reason();
+                            if (isFieldLimitError(reason)) {
+                                // Field limit error - increase limit and retry
+                                fieldLimitErrorDetected[0] = true;
+                                attemptFailed.add(item.id());
+                                log.warn("Field limit error detected for index={}, id={}. Will increase limit and retry.",
+                                        index, item.id());
+                            } else if (isTransientFailure(item.status())) {
                                 // Transient failure - will retry
                                 log.warn("Transient failure on attempt {}/{}. index={}, id={}, reason={}",
-                                        attemptFinal + 1, maxRetries + 1, index, item.id(), item.error().reason());
+                                        attemptFinal + 1, maxRetries + 1, index, item.id(), reason);
                                 attemptFailed.add(item.id());
                             } else {
                                 // Permanent failure - no point retrying
-                                String reason = item.error().reason();
                                 log.error("Permanent failure. index={}, id={}, reason={}",
                                         index, item.id(), reason);
                                 failed.put(item.id(), reason);
                             }
                         }
                     });
+                    
+                    // If field limit error detected, increase the limit
+                    if (fieldLimitErrorDetected[0]) {
+                        increaseFieldLimit(index);
+                    }
                 }
 
                 if (attemptFailed.isEmpty()) {
@@ -495,6 +507,53 @@ public class ElasticsearchIndexer {
                status == 503 || // Service Unavailable
                status == 502 || // Bad Gateway
                status == 504;   // Gateway Timeout
+    }
+
+    /**
+     * Determines if an error is a field limit error that can be fixed by increasing the limit.
+     */
+    private boolean isFieldLimitError(String reason) {
+        if (reason == null) return false;
+        return reason.contains("Limit of total fields") || 
+               reason.toLowerCase().contains("total fields") ||
+               reason.toLowerCase().contains("field limit");
+    }
+
+    /**
+     * Automatically increases the field limit for an index when field limit errors occur.
+     * Increases by 10000 each time to handle diverse document structures.
+     */
+    private void increaseFieldLimit(String index) {
+        try {
+            // Get current settings to check existing limit
+            var currentSettings = client.indices().getSettings(s -> s.index(index));
+            var currentLimitObj = currentSettings.result().get(index).settings().index().mapping().totalFields().limit();
+            
+            // Parse current limit as long (ES returns it as String)
+            long currentLimit = 1000; // default
+            if (currentLimitObj != null) {
+                try {
+                    currentLimit = Long.parseLong(currentLimitObj.toString());
+                } catch (NumberFormatException e) {
+                    log.warn("Could not parse current field limit '{}', using default 1000", currentLimitObj);
+                }
+            }
+            
+            // Increase by 10000
+            long newLimit = currentLimit + 10000;
+            
+            log.warn("Increasing field limit for index '{}' from {} to {}", index, currentLimit, newLimit);
+            
+            client.indices().putSettings(s -> s
+                    .index(index)
+                    .withJson(new java.io.StringReader(
+                            "{\"index.mapping.total_fields.limit\": " + newLimit + "}")));
+            
+            log.info("Successfully increased field limit for index '{}' to {}", index, newLimit);
+            
+        } catch (Exception e) {
+            log.error("Failed to increase field limit for index '{}'", index, e);
+        }
     }
 
     /**

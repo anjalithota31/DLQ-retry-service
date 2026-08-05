@@ -1312,15 +1312,18 @@ consumer.seekToBeginning(consumer.assignment());
                 return;
             }
             
-            log.info("Creating target index '{}' with dynamic mapping enabled", indexName);
+            log.info("Creating target index '{}' with dynamic mapping enabled and increased field limit", indexName);
             
-            // Create index with dynamic mapping enabled to handle various document structures
+            // Create index with dynamic mapping enabled and increased field limit to handle diverse document structures
             esClient.indices().create(c -> c
                     .index(indexName)
+                    .settings(s -> s
+                            .mapping(m -> m
+                                    .totalFields(tf -> tf.limit("2000"))))
                     .mappings(m -> m
                             .dynamic(co.elastic.clients.elasticsearch._types.mapping.DynamicMapping.True)));
             
-            log.info("Successfully created target index '{}'", indexName);
+            log.info("Successfully created target index '{}' with 2000 field limit", indexName);
             
         } catch (Exception e) {
             log.warn("Failed to create target index '{}'. Will rely on ES auto-creation during indexing.", indexName, e);
