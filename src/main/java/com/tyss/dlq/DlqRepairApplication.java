@@ -1353,7 +1353,8 @@ consumer.seekToBeginning(consumer.assignment());
                             .properties("removedFields", p -> p.object(o -> o.dynamic(co.elastic.clients.elasticsearch._types.mapping.DynamicMapping.True)))
                             .properties("esErrorDetails", p -> p.text(t -> t))
                             .properties("processedAt", p -> p.date(d -> d))
-                            .properties("originalDocument", p -> p.text(t -> t))));
+                            .properties("originalDocument", p -> p.text(t -> t))
+                            .properties("correctionRequired", p -> p.boolean_(b -> b))));
             
             log.info("Successfully created document status index '{}'", indexName);
             
