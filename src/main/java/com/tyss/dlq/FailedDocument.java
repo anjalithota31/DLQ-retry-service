@@ -20,28 +20,35 @@ public class FailedDocument {
     private final String esErrorDetails;
     private final String processedAt;
     private final String originalDocument;
+    private final boolean correctionRequired;
 
     public FailedDocument(String indexName, String documentId, String failureReason, Map<String, String> problematicFields) {
-        this(indexName, documentId, failureReason, problematicFields, null, null, null, null, "FAILED");
+        this(indexName, documentId, failureReason, problematicFields, null, null, null, null, "FAILED", false);
     }
 
     public FailedDocument(String indexName, String documentId, String failureReason, String esErrorDetails) {
-        this(indexName, documentId, failureReason, null, null, null, esErrorDetails, null, "FAILED");
+        this(indexName, documentId, failureReason, null, null, null, esErrorDetails, null, "FAILED", false);
     }
 
     public FailedDocument(String indexName, String documentId, String failureReason, Map<String, String> problematicFields,
                          String esErrorDetails, String originalDocument) {
-        this(indexName, documentId, failureReason, problematicFields, null, null, esErrorDetails, originalDocument, "FAILED");
+        this(indexName, documentId, failureReason, problematicFields, null, null, esErrorDetails, originalDocument, "FAILED", false);
     }
 
     public FailedDocument(String indexName, String documentId, String failureReason, Map<String, String> problematicFields,
                          String esErrorDetails, String originalDocument, String status) {
-        this(indexName, documentId, failureReason, problematicFields, null, null, esErrorDetails, originalDocument, status);
+        this(indexName, documentId, failureReason, problematicFields, null, null, esErrorDetails, originalDocument, status, false);
     }
 
     public FailedDocument(String indexName, String documentId, String failureReason, Map<String, String> problematicFields,
                          Map<String, String> repairedFields, Map<String, String> removedFields,
                          String esErrorDetails, String originalDocument, String status) {
+        this(indexName, documentId, failureReason, problematicFields, repairedFields, removedFields, esErrorDetails, originalDocument, status, false);
+    }
+
+    public FailedDocument(String indexName, String documentId, String failureReason, Map<String, String> problematicFields,
+                         Map<String, String> repairedFields, Map<String, String> removedFields,
+                         String esErrorDetails, String originalDocument, String status, boolean correctionRequired) {
         this.indexName         = indexName;
         this.documentId        = documentId;
         this.status            = status;
@@ -52,6 +59,7 @@ public class FailedDocument {
         this.esErrorDetails    = esErrorDetails;
         this.processedAt       = Instant.now().toString();
         this.originalDocument  = originalDocument;
+        this.correctionRequired = correctionRequired;
     }
 
     public String getIndexName()         { return indexName; }
@@ -64,4 +72,5 @@ public class FailedDocument {
     public String getEsErrorDetails()    { return esErrorDetails; }
     public String getProcessedAt()       { return processedAt; }
     public String getOriginalDocument()  { return originalDocument; }
+    public boolean isCorrectionRequired() { return correctionRequired; }
 }

@@ -79,8 +79,6 @@ public class DlqRepairApplication {
         String dlqTopic         = getConfig.apply("dlq.topic");
         String failedIndex      = getConfig.apply("failed.docs.index");
         final String finalFailedIndex = (failedIndex == null) ? "dlq-failed-documents" : failedIndex;
-        String correctedIndex   = getConfig.apply("corrected.docs.index");
-        final String finalCorrectedIndex = (correctedIndex == null) ? "dlq-corrected-documents" : correctedIndex;
         String esUrl            = getConfig.apply("elasticsearch.url");
         final String finalEsUrl = (esUrl == null) ? "http://localhost:9200" : esUrl;
         String targetIndex      = getConfig.apply("target.index");
@@ -397,7 +395,7 @@ consumer.seekToBeginning(consumer.assignment());
                 futures.add(threadPool.submit(() -> {
                     try {
                         processIndexBatch(indexTarget, indexRecords, mapper, mappingCache,
-                                indexer, finalFailedIndex, finalCorrectedIndex, metrics, maxConversionRetries, maxFieldRemovalRetries, esClient);
+                                indexer, finalFailedIndex, metrics, maxConversionRetries, maxFieldRemovalRetries, esClient);
                     } catch (Exception e) {
                         log.error("Error processing batch for index '{}'", indexTarget, e);
                         throw new RuntimeException(e);
@@ -592,7 +590,6 @@ consumer.seekToBeginning(consumer.assignment());
                                           MappingCache mappingCache,
                                           ElasticsearchIndexer indexer,
                                           String failedIndex,
-                                          String correctedIndex,
                                           MetricsCollector metrics,
                                           int maxConversionRetries,
                                           int maxFieldRemovalRetries,
@@ -749,7 +746,7 @@ consumer.seekToBeginning(consumer.assignment());
         // Phase 5: Handle ES indexing failures by removing problematic fields and retrying
         log.info("Phase 5: ES indexing failures to handle with field removal and retry: {}", failedIdsWithReasons.size());
         List<ElasticsearchIndexer.FailureEntry> permanentFailures = new ArrayList<>();
-        List<ElasticsearchIndexer.FailureEntry> correctedDocs = new ArrayList<>();
+        List<ElasticsearchIndexer.FailureEntry> correctedStatusUpdates = new ArrayList<>();
 
         for (String failedId : failedIdsWithReasons.keySet()) {
             PendingRecord pending = pendingById.get(failedId);
@@ -820,23 +817,55 @@ consumer.seekToBeginning(consumer.assignment());
             }
             
             if (successfullyIndexed) {
-                // Document was successfully indexed - store in corrected-documents index for tracking
-                log.info("Document id={} successfully indexed to target index after removing {} field(s)", 
+                // Document was successfully indexed - update status in status index with correctionRequired=true
+                log.info("Document id={} successfully indexed to target index after removing {} field(s)",
                         failedId, allRemovedFields.size());
                 metrics.incrementRecordsSucceeded(1);
-                
-                // Track the corrected document in the corrected-documents index
+
+                // Update the status document with correctionRequired=true
                 try {
                     @SuppressWarnings("unchecked")
                     Map<String, Object> originalDoc = mapper.readValue(pending.record.value(), Map.class);
                     String originalDocJson = mapper.writeValueAsString(originalDoc);
-                    FailedDocument correctedDoc = new FailedDocument(targetIndex, failedId,
-                            "Successfully indexed after removing " + allRemovedFields.size() + " problematic field(s)",
-                            allRemovedFields, null, originalDocJson, "SUCCESS");
-                    correctedDocs.add(new ElasticsearchIndexer.FailureEntry(
-                            failedId, mapper.convertValue(correctedDoc, Map.class)));
+
+                    // Build repaired fields map from original repair result
+                    Map<String, String> repairedFieldsMap = new LinkedHashMap<>();
+                    if (pending.repairResult != null && !pending.repairResult.getRepairedFields().isEmpty()) {
+                        for (RepairAction repair : pending.repairResult.getRepairedFields()) {
+                            repairedFieldsMap.put(repair.getFieldName(), repair.getStrategy());
+                        }
+                    }
+
+                    // Build removed fields map from original repair result + newly removed fields
+                    Map<String, String> removedFieldsMap = new LinkedHashMap<>();
+                    if (pending.repairResult != null && !pending.repairResult.getRemovedFields().isEmpty()) {
+                        for (RemovedField removed : pending.repairResult.getRemovedFields()) {
+                            removedFieldsMap.put(removed.getFieldName(), removed.getReason());
+                        }
+                    }
+                    removedFieldsMap.putAll(allRemovedFields);
+
+                    // Build problematic fields map
+                    Map<String, String> problematicFieldsMap = new LinkedHashMap<>();
+                    if (pending.repairResult != null && !pending.repairResult.getUnconvertibleFields().isEmpty()) {
+                        pending.repairResult.getUnconvertibleFields().forEach((fieldName, unconvertibleField) ->
+                            problematicFieldsMap.put(fieldName, unconvertibleField.getReason()));
+                    }
+
+                    FailedDocument correctedStatusDoc = new FailedDocument(
+                        targetIndex, failedId,
+                        "Successfully indexed after removing " + allRemovedFields.size() + " problematic field(s)",
+                        problematicFieldsMap,
+                        repairedFieldsMap,
+                        removedFieldsMap,
+                        null,
+                        originalDocJson,
+                        "SUCCESS",
+                        true); // correctionRequired = true
+                    correctedStatusUpdates.add(new ElasticsearchIndexer.FailureEntry(
+                            failedId, mapper.convertValue(correctedStatusDoc, Map.class)));
                 } catch (Exception e) {
-                    log.error("Failed to parse original document for corrected tracking. id={}", failedId, e);
+                    log.error("Failed to parse original document for corrected status update. id={}", failedId, e);
                 }
             } else {
                 // Document still failed after max retries, treat as permanent failure
@@ -887,26 +916,26 @@ consumer.seekToBeginning(consumer.assignment());
             log.warn("Phase 5: No permanent ES failures to track");
         }
 
-        // Index successfully corrected documents to corrected-documents index
-        log.info("Preparing to index {} corrected documents to '{}'", correctedDocs.size(), correctedIndex);
-        if (!correctedDocs.isEmpty()) {
-            List<String> failedCorrectedDocs = indexer.bulkIndexFailures(correctedIndex, correctedDocs);
-            if (failedCorrectedDocs.isEmpty()) {
-                log.info("Bulk indexed {} corrected documents to '{}'", correctedDocs.size(), correctedIndex);
+        // Update corrected document status in status index
+        log.info("Preparing to update {} corrected document statuses in '{}'", correctedStatusUpdates.size(), failedIndex);
+        if (!correctedStatusUpdates.isEmpty()) {
+            List<String> failedStatusUpdates = indexer.bulkIndexFailures(failedIndex, correctedStatusUpdates);
+            if (failedStatusUpdates.isEmpty()) {
+                log.info("Bulk updated {} corrected document statuses in '{}'", correctedStatusUpdates.size(), failedIndex);
             } else {
-                log.error("Failed to index {} corrected documents to '{}': {}", failedCorrectedDocs.size(), correctedIndex, failedCorrectedDocs);
-                metrics.incrementFailedDocsIndexFailures(failedCorrectedDocs.size());
-                logToFallbackFile("corrected_tracking_failed", targetIndex, failedCorrectedDocs, mapper);
+                log.error("Failed to update {} corrected document statuses in '{}': {}", failedStatusUpdates.size(), failedIndex, failedStatusUpdates);
+                metrics.incrementFailedDocsIndexFailures(failedStatusUpdates.size());
+                logToFallbackFile("corrected_status_update_failed", targetIndex, failedStatusUpdates, mapper);
             }
         } else {
-            log.warn("Phase 5: No corrected documents to track");
+            log.warn("Phase 5: No corrected document status updates");
         }
-        
+
         // Summary log for batch processing
-        int totalStoredInStatusIndex = allDocumentsStatusBatch.size() + permanentFailures.size() + parseFailureCount;
-        log.info("Batch processing summary for index '{}': Input records={}, Stored in status index={} (Success={}, Failed={}, Permanent ES failures={}, Parse failures={}), Stored in corrected-docs index={}",
-                targetIndex, records.size(), totalStoredInStatusIndex, 
-                targetBatch.size() - failedSet.size(), failedSet.size(), permanentFailures.size(), parseFailureCount, correctedDocs.size());
+        int totalStoredInStatusIndex = allDocumentsStatusBatch.size() + permanentFailures.size() + parseFailureCount + correctedStatusUpdates.size();
+        log.info("Batch processing summary for index '{}': Input records={}, Stored in status index={} (Success={}, Failed={}, Permanent ES failures={}, Parse failures={}, With correction required={})",
+                targetIndex, records.size(), totalStoredInStatusIndex,
+                targetBatch.size() - failedSet.size(), failedSet.size(), permanentFailures.size(), parseFailureCount, correctedStatusUpdates.size());
     }
     
     /**
