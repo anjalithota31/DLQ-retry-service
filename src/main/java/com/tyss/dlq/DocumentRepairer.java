@@ -325,6 +325,16 @@ public class DocumentRepairer {
      *  - Anything else → UNCONVERTIBLE (saved as string in raw index)
      */
     private RepairOutcome repairDate(Object value) {
+        return repairDateStatic(value);
+    }
+
+    /**
+     * Static date repair method for use outside DocumentRepairer instance.
+     *  - String: try common date formats; if parseable → keep as ISO-8601 string
+     *  - Number: epoch millis → valid
+     *  - Anything else → UNCONVERTIBLE (saved as string in raw index)
+     */
+    public static RepairOutcome repairDateStatic(Object value) {
         if (value instanceof Number) return RepairOutcome.valid(); // epoch millis
         if (value instanceof String) {
             String s = ((String) value).trim();
@@ -351,7 +361,11 @@ public class DocumentRepairer {
                 "dd-MM-yyyy HH:mm:ss", "dd/MM/yyyy HH:mm:ss",
                 "yyyy-MM-dd HH:mm", "yyyy-MM-dd HH:mm:ss",
                 "d-M-yyyy H:mm", "d/M/yyyy H:mm",  // Single digit day/month/hour
-                "dd-MM-yyyy H:mm", "dd/MM/yyyy H:mm"  // Single digit hour
+                "dd-MM-yyyy H:mm", "dd/MM/yyyy H:mm",  // Single digit hour
+                "dd-MM-yyyy HH:mm:ss.SSS", "dd/MM/yyyy HH:mm:ss.SSS",  // With milliseconds
+                "yyyy-MM-dd HH:mm:ss.SSS",  // ISO format with milliseconds
+                "dd-MM-yyyy HH:mm:ss.SSSZ", "dd/MM/yyyy HH:mm:ss.SSSZ",  // With timezone
+                "dd-MM-yyyy HH:mm:ssZ", "dd/MM/yyyy HH:mm:ssZ"  // With timezone
             };
             for (String pattern : patterns) {
                 try {
@@ -362,6 +376,7 @@ public class DocumentRepairer {
                         LocalDateTime parsed = LocalDateTime.parse(s, formatter);
                         // Convert to ISO-8601 format with timezone (UTC) - append 'Z' for UTC
                         String iso = parsed.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME) + "Z";
+                        log.debug("Converted date '{}' to ISO format '{}' using pattern '{}'", s, iso, pattern);
                         return RepairOutcome.repaired(iso, "DATE_FORMAT_NORMALIZED_TO_UTC");
                     } else {
                         // Parse date only - use lenient parsing
@@ -369,10 +384,14 @@ public class DocumentRepairer {
                         formatter = formatter.withResolverStyle(java.time.format.ResolverStyle.LENIENT);
                         LocalDate parsed = LocalDate.parse(s, formatter);
                         String iso = parsed.format(DateTimeFormatter.ISO_LOCAL_DATE);
+                        log.debug("Converted date '{}' to ISO format '{}' using pattern '{}'", s, iso, pattern);
                         return RepairOutcome.repaired(iso, "DATE_FORMAT_NORMALIZED");
                     }
-                } catch (DateTimeParseException ignored) {}
+                } catch (DateTimeParseException ignored) {
+                    log.trace("Failed to parse date '{}' with pattern '{}'", s, pattern);
+                }
             }
+            log.warn("Could not parse date '{}' with any known pattern", s);
             return RepairOutcome.unconvertible("Cannot parse '" + s + "' as a date");
         }
         return RepairOutcome.unconvertible("Cannot convert " + value.getClass().getSimpleName() + " to date");

@@ -775,17 +775,44 @@ consumer.seekToBeginning(consumer.assignment());
                 
                 log.info("Identified problematic field '{}' from ES error for id={}", problematicField, failedId);
                 
-                // Remove the problematic field from the document
-                boolean removed = removeNestedField(docForRetry, problematicField);
+                // Try to convert the field value before removing it
+                boolean conversionAttempted = false;
+                boolean conversionSuccessful = false;
                 
-                if (!removed) {
-                    log.warn("Could not remove field '{}' from document id={}, stopping retry loop", problematicField, failedId);
-                    break;
+                // Check if this is a date format error and try conversion
+                if (actualReason.toLowerCase().contains("date") || actualReason.toLowerCase().contains("parse")) {
+                    Object fieldValue = getNestedFieldValue(docForRetry, problematicField);
+                    if (fieldValue != null && fieldValue instanceof String) {
+                        String dateValue = (String) fieldValue;
+                        // Try to convert date format using DocumentRepairer static method
+                        RepairOutcome dateRepair = DocumentRepairer.repairDateStatic(dateValue);
+                        if (dateRepair.getStatus() == RepairOutcome.Status.REPAIRED) {
+                            Object convertedValue = dateRepair.getRepairedValue();
+                            if (setNestedFieldValue(docForRetry, problematicField, convertedValue)) {
+                                conversionAttempted = true;
+                                conversionSuccessful = true;
+                                log.info("Successfully converted date field '{}' from '{}' to '{}'", 
+                                        problematicField, dateValue, convertedValue);
+                            }
+                        }
+                    }
                 }
                 
-                allRemovedFields.put(problematicField, actualReason);
-                log.info("Removed problematic field '{}' from document id={}, remaining fields: {}", 
-                        problematicField, failedId, docForRetry.size());
+                // If conversion failed or wasn't attempted, remove the field
+                if (!conversionSuccessful) {
+                    boolean removed = removeNestedField(docForRetry, problematicField);
+                    
+                    if (!removed) {
+                        log.warn("Could not remove field '{}' from document id={}, stopping retry loop", problematicField, failedId);
+                        break;
+                    }
+                    
+                    allRemovedFields.put(problematicField, actualReason);
+                    log.info("Removed problematic field '{}' from document id={}, remaining fields: {}", 
+                            problematicField, failedId, docForRetry.size());
+                } else {
+                    log.info("Successfully converted field '{}' instead of removing it", problematicField);
+                }
                 
                 if (docForRetry.isEmpty()) {
                     log.warn("Document became empty after removing field '{}' for id={}", problematicField, failedId);
@@ -796,13 +823,13 @@ consumer.seekToBeginning(consumer.assignment());
                 List<ElasticsearchIndexer.BulkEntry> singleRetryBatch = new ArrayList<>();
                 singleRetryBatch.add(new ElasticsearchIndexer.BulkEntry(failedId, docForRetry));
                 
-                log.info("Retrying indexing for id={} after removing field '{}' (attempt {}/{})", 
+                log.info("Retrying indexing for id={} after processing field '{}' (attempt {}/{})", 
                         failedId, problematicField, retryAttempt + 1, maxFieldRemovalRetries);
                 
                 Map<String, String> retryResult = indexer.bulkIndex(targetIndex, singleRetryBatch);
                 
                 if (retryResult.isEmpty()) {
-                    log.info("Successfully indexed document id={} after removing {} field(s)", 
+                    log.info("Successfully indexed document id={} after processing {} field(s)", 
                             failedId, allRemovedFields.size());
                     successfullyIndexed = true;
                     break; // Success, exit retry loop
@@ -817,12 +844,12 @@ consumer.seekToBeginning(consumer.assignment());
             }
             
             if (successfullyIndexed) {
-                // Document was successfully indexed - update status in status index with correctionRequired=true
+                // Document was successfully indexed - update status in status index
                 log.info("Document id={} successfully indexed to target index after removing {} field(s)",
                         failedId, allRemovedFields.size());
                 metrics.incrementRecordsSucceeded(1);
 
-                // Update the status document with correctionRequired=true
+                // Update the status document with removed fields information
                 try {
                     @SuppressWarnings("unchecked")
                     Map<String, Object> originalDoc = mapper.readValue(pending.record.value(), Map.class);
@@ -860,8 +887,7 @@ consumer.seekToBeginning(consumer.assignment());
                         removedFieldsMap,
                         null,
                         originalDocJson,
-                        "SUCCESS",
-                        true); // correctionRequired = true
+                        "SUCCESS");
                     correctedStatusUpdates.add(new ElasticsearchIndexer.FailureEntry(
                             failedId, mapper.convertValue(correctedStatusDoc, Map.class)));
                 } catch (Exception e) {
@@ -933,7 +959,7 @@ consumer.seekToBeginning(consumer.assignment());
 
         // Summary log for batch processing
         int totalStoredInStatusIndex = allDocumentsStatusBatch.size() + permanentFailures.size() + parseFailureCount + correctedStatusUpdates.size();
-        log.info("Batch processing summary for index '{}': Input records={}, Stored in status index={} (Success={}, Failed={}, Permanent ES failures={}, Parse failures={}, With correction required={})",
+        log.info("Batch processing summary for index '{}': Input records={}, Stored in status index={} (Success={}, Failed={}, Permanent ES failures={}, Parse failures={}, With field removal={})",
                 targetIndex, records.size(), totalStoredInStatusIndex,
                 targetBatch.size() - failedSet.size(), failedSet.size(), permanentFailures.size(), parseFailureCount, correctedStatusUpdates.size());
     }
@@ -1142,15 +1168,16 @@ consumer.seekToBeginning(consumer.assignment());
             return null;
         }
 
-        // Pattern 1: Extract field from brackets [field.name]
+        // Pattern 1: Extract field from brackets [field.name] - skip type names
         java.util.regex.Pattern bracketPattern = java.util.regex.Pattern.compile("\\[([^\\]]+)\\]");
         java.util.regex.Matcher bracketMatcher = bracketPattern.matcher(esError);
 
         while (bracketMatcher.find()) {
             String field = bracketMatcher.group(1);
-            // Return the first field that looks like a field path (contains dots)
-            // Also accept fields that might have spaces in them (e.g., "Assign to")
-            if (field.contains(".") || field.matches(".*[a-zA-Z].*")) {
+            // Skip ES type names like "text", "long", "float", "integer", "double", "boolean", "date", "keyword", "object"
+            // Only return actual field paths (contain dots or are longer than typical type names)
+            if (!field.matches("^(text|long|float|integer|double|boolean|date|keyword|object|mapping)$") &&
+                (field.contains(".") || field.matches(".*[a-zA-Z].*"))) {
                 log.debug("Extracted field '{}' from ES error (bracket pattern): {}", field, esError);
                 return field;
             }
@@ -1216,34 +1243,151 @@ consumer.seekToBeginning(consumer.assignment());
     }
 
     /**
+     * Gets a nested field value from a document map.
+     * Field path format: "parent.child.grandchild"
+     * Handles both nested maps and arrays of objects.
+     */
+    private static Object getNestedFieldValue(Map<String, Object> document, String fieldPath) {
+        if (document == null || fieldPath == null || fieldPath.isEmpty()) {
+            return null;
+        }
+
+        String[] parts = fieldPath.split("\\.");
+        if (parts.length == 0) {
+            return null;
+        }
+
+        // Navigate to the target field
+        Object current = document;
+        for (String part : parts) {
+            if (current instanceof Map) {
+                current = ((Map<String, Object>) current).get(part);
+            } else if (current instanceof List && !((List<?>) current).isEmpty()) {
+                // For arrays, return the first element's value (simplified for now)
+                Object firstElement = ((List<?>) current).get(0);
+                if (firstElement instanceof Map) {
+                    current = ((Map<String, Object>) firstElement).get(part);
+                } else {
+                    return null;
+                }
+            } else {
+                return null;
+            }
+            if (current == null) {
+                return null;
+            }
+        }
+        return current;
+    }
+
+    /**
+     * Sets a nested field value in a document map.
+     * Field path format: "parent.child.grandchild"
+     * Handles both nested maps and arrays of objects.
+     */
+    private static boolean setNestedFieldValue(Map<String, Object> document, String fieldPath, Object value) {
+        if (document == null || fieldPath == null || fieldPath.isEmpty()) {
+            return false;
+        }
+
+        String[] parts = fieldPath.split("\\.");
+        if (parts.length == 0) {
+            return false;
+        }
+
+        // Navigate to the parent of the target field
+        Map<String, Object> current = document;
+        for (int i = 0; i < parts.length - 1; i++) {
+            Object next = current.get(parts[i]);
+            if (next instanceof Map) {
+                current = (Map<String, Object>) next;
+            } else if (next instanceof List) {
+                // Handle array of objects - set value in all elements
+                List<Object> list = (List<Object>) next;
+                boolean setInAny = false;
+                for (Object item : list) {
+                    if (item instanceof Map) {
+                        Map<String, Object> itemMap = (Map<String, Object>) item;
+                        // Build the remaining path for this array element
+                        StringBuilder remainingPath = new StringBuilder();
+                        for (int j = i + 1; j < parts.length; j++) {
+                            if (remainingPath.length() > 0) remainingPath.append(".");
+                            remainingPath.append(parts[j]);
+                        }
+                        if (setNestedFieldValue(itemMap, remainingPath.toString(), value)) {
+                            setInAny = true;
+                        }
+                    }
+                }
+                return setInAny;
+            } else {
+                // Path doesn't exist or is not an object
+                return false;
+            }
+        }
+
+        // Set the final field
+        String lastPart = parts[parts.length - 1];
+        current.put(lastPart, value);
+        log.debug("Set field '{}' to value '{}'", fieldPath, value);
+        return true;
+    }
+
+    /**
      * Removes a nested field from a document map.
      * Field path format: "parent.child.grandchild"
+     * Handles both nested maps and arrays of objects.
      */
     private static boolean removeNestedField(Map<String, Object> document, String fieldPath) {
         if (document == null || fieldPath == null || fieldPath.isEmpty()) {
             return false;
         }
-        
+
         String[] parts = fieldPath.split("\\.");
         if (parts.length == 0) {
             return false;
         }
-        
+
         // Navigate to the parent of the target field
         Map<String, Object> current = document;
         for (int i = 0; i < parts.length - 1; i++) {
             Object value = current.get(parts[i]);
             if (value instanceof Map) {
                 current = (Map<String, Object>) value;
+            } else if (value instanceof List) {
+                // Handle array of objects - remove field from all elements
+                List<Object> list = (List<Object>) value;
+                boolean removedFromAny = false;
+                for (Object item : list) {
+                    if (item instanceof Map) {
+                        Map<String, Object> itemMap = (Map<String, Object>) item;
+                        // Build the remaining path for this array element
+                        StringBuilder remainingPath = new StringBuilder();
+                        for (int j = i + 1; j < parts.length; j++) {
+                            if (remainingPath.length() > 0) remainingPath.append(".");
+                            remainingPath.append(parts[j]);
+                        }
+                        if (removeNestedField(itemMap, remainingPath.toString())) {
+                            removedFromAny = true;
+                        }
+                    }
+                }
+                return removedFromAny;
             } else {
                 // Path doesn't exist or is not an object
                 return false;
             }
         }
-        
+
         // Remove the final field
         String lastPart = parts[parts.length - 1];
-        return current.remove(lastPart) != null;
+        Object removed = current.remove(lastPart);
+        if (removed != null) {
+            log.info("Successfully removed field '{}' from document", fieldPath);
+            return true;
+        }
+        log.warn("Field '{}' not found in document", fieldPath);
+        return false;
     }
 
     private static KafkaConsumer<String, String> buildConsumer(Properties appConfig) {
@@ -1353,8 +1497,7 @@ consumer.seekToBeginning(consumer.assignment());
                             .properties("removedFields", p -> p.object(o -> o.dynamic(co.elastic.clients.elasticsearch._types.mapping.DynamicMapping.True)))
                             .properties("esErrorDetails", p -> p.text(t -> t))
                             .properties("processedAt", p -> p.date(d -> d))
-                            .properties("originalDocument", p -> p.text(t -> t))
-                            .properties("correctionRequired", p -> p.boolean_(b -> b))));
+                            .properties("originalDocument", p -> p.text(t -> t))));
             
             log.info("Successfully created document status index '{}'", indexName);
             
