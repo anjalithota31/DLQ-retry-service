@@ -395,7 +395,7 @@ consumer.seekToBeginning(consumer.assignment());
                 futures.add(threadPool.submit(() -> {
                     try {
                         processIndexBatch(indexTarget, indexRecords, mapper, mappingCache,
-                                indexer, finalFailedIndex, metrics, maxConversionRetries, maxFieldRemovalRetries, esClient);
+                                indexer, finalFailedIndex, metrics, maxConversionRetries, maxFieldRemovalRetries, esClient, circuitBreaker);
                     } catch (Exception e) {
                         log.error("Error processing batch for index '{}'", indexTarget, e);
                         throw new RuntimeException(e);
@@ -629,7 +629,8 @@ consumer.seekToBeginning(consumer.assignment());
                                           MetricsCollector metrics,
                                           int maxConversionRetries,
                                           int maxFieldRemovalRetries,
-                                          ElasticsearchClient esClient) {
+                                          ElasticsearchClient esClient,
+                                          CircuitBreaker circuitBreaker) {
         
         log.info("Starting batch processing for index '{}'. Total records: {}", targetIndex, records.size());
         
@@ -714,6 +715,9 @@ consumer.seekToBeginning(consumer.assignment());
 
         // Phase 3: Track ALL documents in dlq-documents-status with SUCCESS/FAILED status and repair details
         List<ElasticsearchIndexer.FailureEntry> allDocumentsStatusBatch = new ArrayList<>();
+        
+        // Log circuit breaker state before status tracking
+        log.info("Phase 3: Circuit breaker state before status tracking: {}", circuitBreaker.getState());
         
         for (ElasticsearchIndexer.BulkEntry entry : targetBatch) {
             PendingRecord pending = pendingById.get(entry.id);
@@ -1546,8 +1550,8 @@ consumer.seekToBeginning(consumer.assignment());
             log.info("Successfully created document status index '{}'", indexName);
             
         } catch (Exception e) {
-            log.warn("Failed to create document status index '{}'. Will rely on auto-creation.", indexName, e);
-            // Don't fail startup - ES may auto-create the index
+            log.error("Failed to create document status index '{}'. Status tracking may fail. Error: {}", indexName, e.getMessage(), e);
+            // Don't fail startup - ES may auto-create the index, but log as error for visibility
         }
     }
 

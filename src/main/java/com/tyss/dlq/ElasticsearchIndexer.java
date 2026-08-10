@@ -74,6 +74,7 @@ public class ElasticsearchIndexer {
     /**
      * Bulk-indexes failure documents into the failed-documents index.
      * Returns the list of IDs that FAILED to index (empty = all succeeded).
+     * Note: This method bypasses circuit breaker to ensure status tracking always works.
      */
     public List<String> bulkIndexFailures(String index, List<FailureEntry> entries) {
         List<String> failed = new ArrayList<>();
@@ -95,6 +96,7 @@ public class ElasticsearchIndexer {
 
         if (bulkOperations.isEmpty()) return failed;
 
+        // Note: Circuit breaker check removed for status tracking to ensure it always works
         // Retry logic with exponential backoff
         int attempt = 0;
         long backoffMs = initialRetryBackoffMs;
