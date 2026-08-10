@@ -159,6 +159,8 @@ public class DocumentRepairer {
     private void repairNestedFields(Map<String, Object> document, Map<String, Object> mapping, String pathPrefix,
                                     List<RepairAction> repairedFields, List<RemovedField> removedFields,
                                     Map<String, RepairResult.UnconvertibleField> unconvertibleFields) {
+        List<String> keysToRemove = new ArrayList<>();
+        
         for (Map.Entry<String, Object> entry : document.entrySet()) {
             String fieldName = entry.getKey();
             Object fieldValue = entry.getValue();
@@ -166,7 +168,7 @@ public class DocumentRepairer {
 
             // Filter out metadata fields at nested levels
             if (isMetadataField(fieldName)) {
-                document.remove(fieldName);
+                keysToRemove.add(fieldName);
                 log.debug("Filtered out nested metadata field: '{}'", fullPath);
                 continue;
             }
@@ -190,7 +192,7 @@ public class DocumentRepairer {
                     log.debug("Found mapping for '{}' in parent, using it for nested repair", fullPath);
                 } else {
                     // No mapping available, mark entire nested object as unconvertible
-                    document.remove(fieldName);
+                    keysToRemove.add(fieldName);
                     unconvertibleFields.put(fullPath, new RepairResult.UnconvertibleField(
                             toRawString(fieldValue), "object", "Nested object has no mapping"));
                     log.warn("Nested object '{}' has no mapping - marked as unconvertible", fullPath);
@@ -203,6 +205,8 @@ public class DocumentRepairer {
 
             // If this field has nested properties, repair them
             if (nestedProperties != null && !nestedProperties.isEmpty()) {
+                List<String> nestedKeysToRemove = new ArrayList<>();
+                
                 for (Map.Entry<String, Object> nestedEntry : fieldValueMap.entrySet()) {
                     String nestedFieldName = nestedEntry.getKey();
                     Object nestedFieldValue = nestedEntry.getValue();
@@ -230,7 +234,7 @@ public class DocumentRepairer {
                             log.info("Converted nested field '{}' to object: strategy={}", nestedFullPath, arrayConversionOutcome.getStrategy());
                             continue;
                         } else if (arrayConversionOutcome.getStatus() == RepairOutcome.Status.UNCONVERTIBLE) {
-                            fieldValueMap.remove(nestedFieldName);
+                            nestedKeysToRemove.add(nestedFieldName);
                             unconvertibleFields.put(nestedFullPath, new RepairResult.UnconvertibleField(
                                     toRawString(nestedFieldValue), nestedEsType, arrayConversionOutcome.getReason()));
                             log.warn("Unconvertible nested field '{}' (esType={}): reason='{}'",
@@ -254,14 +258,14 @@ public class DocumentRepairer {
                                     nestedFullPath, nestedFieldValue, outcome.getRepairedValue(), outcome.getStrategy());
                             break;
                         case REMOVED:
-                            fieldValueMap.remove(nestedFieldName);
+                            nestedKeysToRemove.add(nestedFieldName);
                             removedFields.add(new RemovedField(nestedFullPath, nestedEsType,
                                     String.valueOf(nestedFieldValue), outcome.getReason()));
                             log.warn("Removed nested field '{}': value='{}', reason='{}'",
                                     nestedFullPath, nestedFieldValue, outcome.getReason());
                             break;
                         case UNCONVERTIBLE:
-                            fieldValueMap.remove(nestedFieldName);
+                            nestedKeysToRemove.add(nestedFieldName);
                             unconvertibleFields.put(nestedFullPath, new RepairResult.UnconvertibleField(
                                     toRawString(nestedFieldValue), nestedEsType, outcome.getReason()));
                             log.warn("Unconvertible nested field '{}' (esType={}): kept as string in raw index. reason='{}'",
@@ -269,10 +273,20 @@ public class DocumentRepairer {
                             break;
                     }
                 }
+                
+                // Remove nested keys after iteration
+                for (String key : nestedKeysToRemove) {
+                    fieldValueMap.remove(key);
+                }
 
                 // Recursively repair deeper nested structures
                 repairNestedFields(fieldValueMap, nestedProperties, fullPath, repairedFields, removedFields, unconvertibleFields);
             }
+        }
+        
+        // Remove keys after iteration
+        for (String key : keysToRemove) {
+            document.remove(key);
         }
     }
 
