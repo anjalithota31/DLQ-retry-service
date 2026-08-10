@@ -442,7 +442,7 @@ consumer.seekToBeginning(consumer.assignment());
                                            String targetIndex,
                                            ObjectMapper mapper) {
         try {
-            String esId = toEsId(record.key());
+            String esId = toEsId(record.key(), record.value());
             FailedDocument failedDoc = new FailedDocument(
                     targetIndex,
                     esId,
@@ -450,7 +450,7 @@ consumer.seekToBeginning(consumer.assignment());
                     "ES rejected document after repair");
             indexer.index(failedIndex, esId, mapper.convertValue(failedDoc, Map.class));
         } catch (Exception e) {
-            log.error("Could not store index-failure doc. id={}. Record may be lost.", toEsId(record.key()), e);
+            log.error("Could not store index-failure doc. id={}. Record may be lost.", toEsId(record.key(), record.value()), e);
         }
     }
 
@@ -462,15 +462,34 @@ consumer.seekToBeginning(consumer.assignment());
                                            String targetIndex,
                                            ObjectMapper mapper) {
         try {
-            String esId = toEsId(record.key());
+            String esId = toEsId(record.key(), record.value());
+            
+            // Build detailed error message with exception type and message
+            String errorType = cause.getClass().getSimpleName();
+            String errorMessage = cause.getMessage();
+            String detailedError = String.format("%s: %s", errorType, 
+                errorMessage != null ? errorMessage : "No error message provided");
+            
+            // Include stack trace snippet for debugging
+            StringBuilder stackTrace = new StringBuilder();
+            for (StackTraceElement element : cause.getStackTrace()) {
+                stackTrace.append("\n    at ").append(element.toString());
+                if (stackTrace.length() > 500) { // Limit stack trace length
+                    stackTrace.append("\n    ...");
+                    break;
+                }
+            }
+            
+            String fullErrorDetails = detailedError + stackTrace.toString();
+            
             FailedDocument failedDoc = new FailedDocument(
                     targetIndex,
                     esId,
-                    "Parse/repair error: " + cause.getMessage(),
-                    "Parse/repair error: " + cause.getMessage());
+                    detailedError,
+                    fullErrorDetails);
             indexer.index(failedIndex, esId, mapper.convertValue(failedDoc, Map.class));
         } catch (Exception e) {
-            log.error("Could not store parse-failure doc. id={}. Record may be lost.", toEsId(record.key()), e);
+            log.error("Could not store parse-failure doc. id={}. Record may be lost.", toEsId(record.key(), record.value()), e);
         }
     }
 
@@ -479,7 +498,7 @@ consumer.seekToBeginning(consumer.assignment());
                                                                      RepairResult repairResult,
                                                                      String targetIndex,
                                                                      ObjectMapper mapper) {
-        String esId = toEsId(record.key());
+        String esId = toEsId(record.key(), record.value());
         
         // Build map of unconvertible field names with their reasons
         Map<String, String> problematicFieldsWithReasons = new LinkedHashMap<>();
@@ -538,14 +557,31 @@ consumer.seekToBeginning(consumer.assignment());
     /**
      * Safely converts a Kafka record key to a valid Elasticsearch document ID.
      * Handles null keys, Struct objects, and other non-string types.
+     * For null keys, generates a deterministic ID based on document content hash.
      */
-    private static String toEsId(Object key) {
+    private static String toEsId(Object key, String documentValue) {
         if (key == null) {
-            return java.util.UUID.randomUUID().toString();
+            // Generate deterministic ID from document content hash for null keys
+            // This ensures same document always gets same ID on reprocessing
+            try {
+                java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+                byte[] hash = digest.digest(documentValue.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                StringBuilder hexString = new StringBuilder();
+                for (byte b : hash) {
+                    String hex = Integer.toHexString(0xff & b);
+                    if (hex.length() == 1) hexString.append('0');
+                    hexString.append(hex);
+                }
+                // Use first 32 chars of hash as ID (128 bits, sufficient for uniqueness)
+                return "nullkey_" + hexString.substring(0, 32);
+            } catch (Exception e) {
+                log.warn("Failed to generate hash-based ID for null key, falling back to UUID", e);
+                return java.util.UUID.randomUUID().toString();
+            }
         }
         if (key instanceof String) {
             String strKey = (String) key;
-            return strKey.isEmpty() ? java.util.UUID.randomUUID().toString() : strKey;
+            return strKey.isEmpty() ? ("emptykey_" + java.util.UUID.randomUUID().toString()) : strKey;
         }
         // For non-string keys (e.g., Kafka Connect Struct), convert to JSON string
         try {
@@ -556,7 +592,7 @@ consumer.seekToBeginning(consumer.assignment());
         } catch (Exception e) {
             // Fallback to toString() with sanitization
             String strKey = key.toString().replaceAll("[^a-zA-Z0-9_-]", "_");
-            return strKey.isEmpty() ? java.util.UUID.randomUUID().toString() : strKey;
+            return strKey.isEmpty() ? ("emptykey_" + java.util.UUID.randomUUID().toString()) : strKey;
         }
     }
 
@@ -617,7 +653,7 @@ consumer.seekToBeginning(consumer.assignment());
 
                 RepairResult result = indexRepairer.repair(originalDoc);
 
-                String esId = toEsId(record.key());
+                String esId = toEsId(record.key(), record.value());
                 log.debug("Repaired record. id={}, repaired={}, removed={}, unconvertible={}",
                         esId,
                         result.getRepairedFields().size(),
@@ -648,8 +684,16 @@ consumer.seekToBeginning(consumer.assignment());
             } catch (Exception e) {
                 // Malformed JSON or unexpected repair crash — store directly in failed-docs
                 parseFailureCount++;
-                log.error("Failed to parse/repair DLQ record. offset={}, key={}. Storing in failed-docs index.",
-                        record.offset(), record.key(), e);
+                
+                // Log detailed information about the failed record
+                String recordValuePreview = record.value() != null 
+                    ? (record.value().length() > 200 ? record.value().substring(0, 200) + "..." : record.value())
+                    : "null";
+                
+                log.error("Failed to parse/repair DLQ record. offset={}, key={}, topic={}, partition={}, value_preview='{}'. Storing in failed-docs index. Exception type: {}, message: {}",
+                        record.offset(), record.key(), record.topic(), record.partition(), 
+                        recordValuePreview, e.getClass().getSimpleName(), e.getMessage(), e);
+                
                 storeParseFailure(record, e, indexer, failedIndex, targetIndex, mapper);
             }
         }
