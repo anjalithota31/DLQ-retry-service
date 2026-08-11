@@ -601,15 +601,16 @@ consumer.seekToBeginning(consumer.assignment());
         if (key != null) {
             String keyStr = key.toString();
             // Pattern to match: Struct{fullDocument.unique=<value>}
-            java.util.regex.Pattern structPattern = java.util.regex.Pattern.compile("Struct\\{fullDocument\\.unique=([^}]+)\\}");
+            // Make pattern more flexible to handle different Struct formats
+            java.util.regex.Pattern structPattern = java.util.regex.Pattern.compile("Struct\\{[^}]*fullDocument\\.unique=([^,}]+)");
             java.util.regex.Matcher structMatcher = structPattern.matcher(keyStr);
             if (structMatcher.find()) {
                 String uniqueFromKey = structMatcher.group(1);
                 if (uniqueFromKey.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 512) {
-                    log.debug("Using 'unique' field from Struct key as document ID: {}", uniqueFromKey);
+                    log.info("Using 'unique' field from Struct key as document ID: {}", uniqueFromKey);
                     return uniqueFromKey;
                 } else {
-                    log.warn("'unique' field from Struct key exceeds 512 bytes ({} bytes), generating hash-based ID instead", 
+                    log.warn("'unique' field from Struct key exceeds 512 bytes ({} bytes), generating hash-based ID instead",
                             uniqueFromKey.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
                     try {
                         java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
@@ -626,6 +627,8 @@ consumer.seekToBeginning(consumer.assignment());
                         return java.util.UUID.randomUUID().toString();
                     }
                 }
+            } else {
+                log.warn("Could not extract unique from Struct key using pattern. Key string: {}", keyStr);
             }
         }
         
@@ -750,6 +753,8 @@ consumer.seekToBeginning(consumer.assignment());
                 RepairResult result = indexRepairer.repair(originalDoc);
 
                 String esId = toEsId(record.key(), record.value());
+                log.info("Processing document. id={}, topic={}, partition={}, offset={}",
+                        esId, record.topic(), record.partition(), record.offset());
                 log.debug("Repaired record. id={}, repaired={}, removed={}, unconvertible={}",
                         esId,
                         result.getRepairedFields().size(),
