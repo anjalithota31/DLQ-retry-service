@@ -555,11 +555,83 @@ consumer.seekToBeginning(consumer.assignment());
     }
 
     /**
-     * Safely converts a Kafka record key to a valid Elasticsearch document ID.
+     * Safely converts a Kafka record to a valid Elasticsearch document ID.
+     * First attempts to extract the "unique" field from the document content.
+     * If not found, tries to extract from Kafka Connect Struct key format: "Struct{fullDocument.unique=...}"
+     * If still not found, falls back to using the Kafka record key directly.
      * Handles null keys, Struct objects, and other non-string types.
-     * For null keys, generates a deterministic ID based on document content hash.
+     * For null keys or missing unique field, generates a deterministic ID based on document content hash.
+     * Also handles IDs that exceed Elasticsearch's 512-byte limit by generating hash-based IDs.
      */
     private static String toEsId(Object key, String documentValue) {
+        // First, try to extract the "unique" field from the document content
+        if (documentValue != null && !documentValue.isEmpty()) {
+            try {
+                ObjectMapper mapper = new ObjectMapper();
+                @SuppressWarnings("unchecked")
+                Map<String, Object> docMap = mapper.readValue(documentValue, Map.class);
+                Object uniqueValue = docMap.get("unique");
+                if (uniqueValue != null) {
+                    String uniqueId = uniqueValue.toString();
+                    // Check if the unique field value exceeds 512 bytes
+                    if (uniqueId.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 512) {
+                        log.debug("Using 'unique' field from document as document ID: {}", uniqueId);
+                        return uniqueId;
+                    } else {
+                        log.warn("'unique' field exceeds 512 bytes ({} bytes), generating hash-based ID instead", 
+                                uniqueId.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+                        // Generate hash of the unique field value
+                        java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+                        byte[] hash = digest.digest(uniqueId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                        StringBuilder hexString = new StringBuilder();
+                        for (byte b : hash) {
+                            String hex = Integer.toHexString(0xff & b);
+                            if (hex.length() == 1) hexString.append('0');
+                            hexString.append(hex);
+                        }
+                        return "unique_" + hexString.substring(0, 32);
+                    }
+                }
+            } catch (Exception e) {
+                log.debug("Could not extract 'unique' field from document, trying key-based extraction", e);
+            }
+        }
+        
+        // Second, try to extract unique from Kafka Connect Struct key format: "Struct{fullDocument.unique=...}"
+        if (key != null) {
+            String keyStr = key.toString();
+            // Pattern to match: Struct{fullDocument.unique=<value>}
+            java.util.regex.Pattern structPattern = java.util.regex.Pattern.compile("Struct\\{fullDocument\\.unique=([^}]+)\\}");
+            java.util.regex.Matcher structMatcher = structPattern.matcher(keyStr);
+            if (structMatcher.find()) {
+                String uniqueFromKey = structMatcher.group(1);
+                if (uniqueFromKey.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 512) {
+                    log.debug("Using 'unique' field from Struct key as document ID: {}", uniqueFromKey);
+                    return uniqueFromKey;
+                } else {
+                    log.warn("'unique' field from Struct key exceeds 512 bytes ({} bytes), generating hash-based ID instead", 
+                            uniqueFromKey.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+                    try {
+                        java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+                        byte[] hash = digest.digest(uniqueFromKey.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                        StringBuilder hexString = new StringBuilder();
+                        for (byte b : hash) {
+                            String hex = Integer.toHexString(0xff & b);
+                            if (hex.length() == 1) hexString.append('0');
+                            hexString.append(hex);
+                        }
+                        return "unique_" + hexString.substring(0, 32);
+                    } catch (Exception e) {
+                        log.warn("Failed to generate hash-based ID for long unique from key, falling back to UUID", e);
+                        return java.util.UUID.randomUUID().toString();
+                    }
+                }
+            }
+        }
+        
+        // Fallback to key-based ID generation
+        String candidateId;
+        
         if (key == null) {
             // Generate deterministic ID from document content hash for null keys
             // This ensures same document always gets same ID on reprocessing
@@ -573,27 +645,50 @@ consumer.seekToBeginning(consumer.assignment());
                     hexString.append(hex);
                 }
                 // Use first 32 chars of hash as ID (128 bits, sufficient for uniqueness)
-                return "nullkey_" + hexString.substring(0, 32);
+                candidateId = "nullkey_" + hexString.substring(0, 32);
             } catch (Exception e) {
                 log.warn("Failed to generate hash-based ID for null key, falling back to UUID", e);
+                candidateId = java.util.UUID.randomUUID().toString();
+            }
+        } else if (key instanceof String) {
+            String strKey = (String) key;
+            candidateId = strKey.isEmpty() ? ("emptykey_" + java.util.UUID.randomUUID().toString()) : strKey;
+        } else {
+            // For non-string keys (e.g., Kafka Connect Struct), convert to JSON string
+            try {
+                ObjectMapper mapper = new ObjectMapper();
+                String jsonKey = mapper.writeValueAsString(key);
+                // Remove special characters that are invalid in ES IDs
+                candidateId = jsonKey.replaceAll("[^a-zA-Z0-9_-]", "_");
+            } catch (Exception e) {
+                // Fallback to toString() with sanitization
+                String strKey = key.toString().replaceAll("[^a-zA-Z0-9_-]", "_");
+                candidateId = strKey.isEmpty() ? ("emptykey_" + java.util.UUID.randomUUID().toString()) : strKey;
+            }
+        }
+        
+        // Check if ID exceeds Elasticsearch's 512-byte limit
+        if (candidateId.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 512) {
+            log.warn("Document ID exceeds 512 bytes ({} bytes), generating hash-based ID instead. Original ID length: {}", 
+                    candidateId.getBytes(java.nio.charset.StandardCharsets.UTF_8).length, candidateId.length());
+            try {
+                java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+                byte[] hash = digest.digest(candidateId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                StringBuilder hexString = new StringBuilder();
+                for (byte b : hash) {
+                    String hex = Integer.toHexString(0xff & b);
+                    if (hex.length() == 1) hexString.append('0');
+                    hexString.append(hex);
+                }
+                // Use first 32 chars of hash as ID (128 bits, sufficient for uniqueness)
+                return "longid_" + hexString.substring(0, 32);
+            } catch (Exception e) {
+                log.warn("Failed to generate hash-based ID for long ID, falling back to UUID", e);
                 return java.util.UUID.randomUUID().toString();
             }
         }
-        if (key instanceof String) {
-            String strKey = (String) key;
-            return strKey.isEmpty() ? ("emptykey_" + java.util.UUID.randomUUID().toString()) : strKey;
-        }
-        // For non-string keys (e.g., Kafka Connect Struct), convert to JSON string
-        try {
-            ObjectMapper mapper = new ObjectMapper();
-            String jsonKey = mapper.writeValueAsString(key);
-            // Remove special characters that are invalid in ES IDs
-            return jsonKey.replaceAll("[^a-zA-Z0-9_-]", "_");
-        } catch (Exception e) {
-            // Fallback to toString() with sanitization
-            String strKey = key.toString().replaceAll("[^a-zA-Z0-9_-]", "_");
-            return strKey.isEmpty() ? ("emptykey_" + java.util.UUID.randomUUID().toString()) : strKey;
-        }
+        
+        return candidateId;
     }
 
     /**
