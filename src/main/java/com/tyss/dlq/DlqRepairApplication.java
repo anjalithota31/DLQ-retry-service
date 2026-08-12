@@ -605,25 +605,25 @@ consumer.seekToBeginning(consumer.assignment());
             java.util.regex.Pattern structPattern = java.util.regex.Pattern.compile("Struct\\{[^}]*fullDocument\\.unique=([^,}]+)");
             java.util.regex.Matcher structMatcher = structPattern.matcher(keyStr);
             if (structMatcher.find()) {
-                String uniqueFromKey = structMatcher.group(1);
-                if (uniqueFromKey.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 512) {
-                    log.info("Using 'unique' field from Struct key as document ID: {}", uniqueFromKey);
-                    return uniqueFromKey;
+                // Return the full Struct format instead of just the unique value
+                if (keyStr.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 512) {
+                    log.info("Using full Struct key as document ID: {}", keyStr);
+                    return keyStr;
                 } else {
-                    log.warn("'unique' field from Struct key exceeds 512 bytes ({} bytes), generating hash-based ID instead",
-                            uniqueFromKey.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+                    log.warn("Struct key exceeds 512 bytes ({} bytes), generating hash-based ID instead",
+                            keyStr.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
                     try {
                         java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
-                        byte[] hash = digest.digest(uniqueFromKey.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                        byte[] hash = digest.digest(keyStr.getBytes(java.nio.charset.StandardCharsets.UTF_8));
                         StringBuilder hexString = new StringBuilder();
                         for (byte b : hash) {
                             String hex = Integer.toHexString(0xff & b);
                             if (hex.length() == 1) hexString.append('0');
                             hexString.append(hex);
                         }
-                        return "unique_" + hexString.substring(0, 32);
+                        return "struct_" + hexString.substring(0, 32);
                     } catch (Exception e) {
-                        log.warn("Failed to generate hash-based ID for long unique from key, falling back to UUID", e);
+                        log.warn("Failed to generate hash-based ID for long Struct key, falling back to UUID", e);
                         return java.util.UUID.randomUUID().toString();
                     }
                 }

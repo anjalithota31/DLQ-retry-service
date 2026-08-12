@@ -477,6 +477,11 @@ public class DocumentRepairer {
 
     private RepairOutcome repairText(Object value, String esType) {
         if (value instanceof String) return RepairOutcome.valid();
+        // Elasticsearch supports arrays for text/keyword fields - preserve them as-is
+        if (value instanceof List || value.getClass().isArray()) {
+            log.debug("Preserving array for text/keyword field");
+            return RepairOutcome.valid();
+        }
         if (value instanceof Number || value instanceof Boolean) {
             return RepairOutcome.repaired(String.valueOf(value), "SCALAR_TO_" + esType.toUpperCase());
         }
