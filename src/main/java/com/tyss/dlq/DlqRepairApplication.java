@@ -556,48 +556,16 @@ consumer.seekToBeginning(consumer.assignment());
 
     /**
      * Safely converts a Kafka record to a valid Elasticsearch document ID.
-     * First attempts to extract the "unique" field from the document content.
-     * If not found, tries to extract from Kafka Connect Struct key format: "Struct{fullDocument.unique=...}"
+     * First attempts to extract from Kafka Connect Struct key format: "Struct{fullDocument.unique=...}"
+     * If not found, tries to extract the "unique" field from the document content.
      * If still not found, falls back to using the Kafka record key directly.
      * Handles null keys, Struct objects, and other non-string types.
      * For null keys or missing unique field, generates a deterministic ID based on document content hash.
      * Also handles IDs that exceed Elasticsearch's 512-byte limit by generating hash-based IDs.
      */
     private static String toEsId(Object key, String documentValue) {
-        // First, try to extract the "unique" field from the document content
-        if (documentValue != null && !documentValue.isEmpty()) {
-            try {
-                ObjectMapper mapper = new ObjectMapper();
-                @SuppressWarnings("unchecked")
-                Map<String, Object> docMap = mapper.readValue(documentValue, Map.class);
-                Object uniqueValue = docMap.get("unique");
-                if (uniqueValue != null) {
-                    String uniqueId = uniqueValue.toString();
-                    // Check if the unique field value exceeds 512 bytes
-                    if (uniqueId.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 512) {
-                        log.debug("Using 'unique' field from document as document ID: {}", uniqueId);
-                        return uniqueId;
-                    } else {
-                        log.warn("'unique' field exceeds 512 bytes ({} bytes), generating hash-based ID instead", 
-                                uniqueId.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
-                        // Generate hash of the unique field value
-                        java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
-                        byte[] hash = digest.digest(uniqueId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                        StringBuilder hexString = new StringBuilder();
-                        for (byte b : hash) {
-                            String hex = Integer.toHexString(0xff & b);
-                            if (hex.length() == 1) hexString.append('0');
-                            hexString.append(hex);
-                        }
-                        return "unique_" + hexString.substring(0, 32);
-                    }
-                }
-            } catch (Exception e) {
-                log.debug("Could not extract 'unique' field from document, trying key-based extraction", e);
-            }
-        }
-        
-        // Second, try to extract unique from Kafka Connect Struct key format: "Struct{fullDocument.unique=...}"
+        // First, try to extract unique from Kafka Connect Struct key format: "Struct{fullDocument.unique=...}"
+        // This takes priority over document content extraction to preserve the full Struct format
         if (key != null) {
             String keyStr = key.toString();
             // Pattern to match: Struct{fullDocument.unique=<value>}
@@ -627,8 +595,39 @@ consumer.seekToBeginning(consumer.assignment());
                         return java.util.UUID.randomUUID().toString();
                     }
                 }
-            } else {
-                log.warn("Could not extract unique from Struct key using pattern. Key string: {}", keyStr);
+            }
+        }
+        
+        // Second, try to extract the "unique" field from the document content
+        if (documentValue != null && !documentValue.isEmpty()) {
+            try {
+                ObjectMapper mapper = new ObjectMapper();
+                @SuppressWarnings("unchecked")
+                Map<String, Object> docMap = mapper.readValue(documentValue, Map.class);
+                Object uniqueValue = docMap.get("unique");
+                if (uniqueValue != null) {
+                    String uniqueId = uniqueValue.toString();
+                    // Check if the unique field value exceeds 512 bytes
+                    if (uniqueId.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 512) {
+                        log.debug("Using 'unique' field from document as document ID: {}", uniqueId);
+                        return uniqueId;
+                    } else {
+                        log.warn("'unique' field exceeds 512 bytes ({} bytes), generating hash-based ID instead", 
+                                uniqueId.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+                        // Generate hash of the unique field value
+                        java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+                        byte[] hash = digest.digest(uniqueId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                        StringBuilder hexString = new StringBuilder();
+                        for (byte b : hash) {
+                            String hex = Integer.toHexString(0xff & b);
+                            if (hex.length() == 1) hexString.append('0');
+                            hexString.append(hex);
+                        }
+                        return "unique_" + hexString.substring(0, 32);
+                    }
+                }
+            } catch (Exception e) {
+                log.debug("Could not extract 'unique' field from document, trying key-based extraction", e);
             }
         }
         
