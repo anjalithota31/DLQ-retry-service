@@ -569,8 +569,8 @@ consumer.seekToBeginning(consumer.assignment());
         if (key != null) {
             String keyStr = key.toString();
             // Pattern to match: Struct{fullDocument.unique=<value>}
-            // Make pattern more flexible to handle different Struct formats
-            java.util.regex.Pattern structPattern = java.util.regex.Pattern.compile("Struct\\{[^}]*fullDocument\\.unique=([^,}]+)");
+            // Updated pattern to handle the exact format: Struct{fullDocument.unique=optimize_demo_LIC2026757PJT1824_module_dataMOD_DATA1c113210-8141-4b39-8170-9b65b8a2af36}
+            java.util.regex.Pattern structPattern = java.util.regex.Pattern.compile("Struct\\{.*?fullDocument\\.unique=([^}]+)\\}");
             java.util.regex.Matcher structMatcher = structPattern.matcher(keyStr);
             if (structMatcher.find()) {
                 // Return the full Struct format instead of just the unique value
