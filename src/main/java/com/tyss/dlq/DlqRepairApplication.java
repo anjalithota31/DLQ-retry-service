@@ -592,16 +592,17 @@ public class DlqRepairApplication {
             java.util.regex.Pattern structPattern = java.util.regex.Pattern.compile("Struct\\{.*?fullDocument\\.unique=([^}]+)\\}");
             java.util.regex.Matcher structMatcher = structPattern.matcher(keyStr);
             if (structMatcher.find()) {
-                // Return the full Struct format instead of just the unique value
-                if (keyStr.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 512) {
-                    log.info("Using full Struct key as document ID: {}", keyStr);
-                    return keyStr;
+                // Extract only the unique value from Struct key to ensure consistent ID generation
+                String uniqueValue = structMatcher.group(1);
+                if (uniqueValue.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 512) {
+                    log.info("Using unique value from Struct key as document ID: {}", uniqueValue);
+                    return uniqueValue;
                 } else {
-                    log.warn("Struct key exceeds 512 bytes ({} bytes), generating hash-based ID instead",
-                            keyStr.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+                    log.warn("Unique value exceeds 512 bytes ({} bytes), generating hash-based ID instead",
+                            uniqueValue.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
                     try {
                         java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
-                        byte[] hash = digest.digest(keyStr.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                        byte[] hash = digest.digest(uniqueValue.getBytes(java.nio.charset.StandardCharsets.UTF_8));
                         StringBuilder hexString = new StringBuilder();
                         for (byte b : hash) {
                             String hex = Integer.toHexString(0xff & b);
