@@ -8,6 +8,7 @@ com\tyss\dlq\ElasticsearchIndexer$RawBulkEntry.class
 com\tyss\dlq\RateLimiter.class
 com\tyss\dlq\ElasticsearchIndexer$FailureEntry.class
 com\tyss\dlq\HealthCheckServer.class
+com\tyss\dlq\DlqRepairApplication$ParseFailureRecord.class
 com\tyss\dlq\DocumentRepairer$1.class
 com\tyss\dlq\RepairAction.class
 com\tyss\dlq\RepairOutcome.class

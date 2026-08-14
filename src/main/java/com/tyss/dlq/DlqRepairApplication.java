@@ -626,9 +626,9 @@ public class DlqRepairApplication {
                 ObjectMapper mapper = new ObjectMapper();
                 @SuppressWarnings("unchecked")
                 Map<String, Object> docMap = mapper.readValue(documentValue, Map.class);
-                Object uniqueValue = docMap.get("unique");
-                if (uniqueValue != null) {
-                    String uniqueId = uniqueValue.toString();
+                Object docUniqueValue = docMap.get("unique");
+                if (docUniqueValue != null) {
+                    String uniqueId = docUniqueValue.toString();
                     // Construct Struct format for consistency
                     String structFormatId = "Struct{fullDocument.unique=" + uniqueId + "}";
                     // Check if the Struct format exceeds 512 bytes
