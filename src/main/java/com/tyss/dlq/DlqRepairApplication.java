@@ -584,25 +584,27 @@ public class DlqRepairApplication {
      */
     private static String toEsId(Object key, String documentValue) {
         // First, try to extract unique from Kafka Connect Struct key format: "Struct{fullDocument.unique=...}"
-        // This takes priority over document content extraction to preserve the full Struct format
+        // This ensures consistent ID format across all documents
+        String uniqueValue = null;
+        
         if (key != null) {
             String keyStr = key.toString();
             // Pattern to match: Struct{fullDocument.unique=<value>}
-            // Updated pattern to handle the exact format: Struct{fullDocument.unique=optimize_demo_LIC2026757PJT1824_module_dataMOD_DATA1c113210-8141-4b39-8170-9b65b8a2af36}
             java.util.regex.Pattern structPattern = java.util.regex.Pattern.compile("Struct\\{.*?fullDocument\\.unique=([^}]+)\\}");
             java.util.regex.Matcher structMatcher = structPattern.matcher(keyStr);
             if (structMatcher.find()) {
-                // Extract only the unique value from Struct key to ensure consistent ID generation
-                String uniqueValue = structMatcher.group(1);
-                if (uniqueValue.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 512) {
-                    log.info("Using unique value from Struct key as document ID: {}", uniqueValue);
-                    return uniqueValue;
+                // Extract the unique value from Struct key
+                uniqueValue = structMatcher.group(1);
+                // Return the full Struct format to maintain consistency
+                if (keyStr.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 512) {
+                    log.info("Using full Struct key as document ID: {}", keyStr);
+                    return keyStr;
                 } else {
-                    log.warn("Unique value exceeds 512 bytes ({} bytes), generating hash-based ID instead",
-                            uniqueValue.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+                    log.warn("Struct key exceeds 512 bytes ({} bytes), generating hash-based ID instead",
+                            keyStr.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
                     try {
                         java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
-                        byte[] hash = digest.digest(uniqueValue.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                        byte[] hash = digest.digest(keyStr.getBytes(java.nio.charset.StandardCharsets.UTF_8));
                         StringBuilder hexString = new StringBuilder();
                         for (byte b : hash) {
                             String hex = Integer.toHexString(0xff & b);
@@ -627,13 +629,15 @@ public class DlqRepairApplication {
                 Object uniqueValue = docMap.get("unique");
                 if (uniqueValue != null) {
                     String uniqueId = uniqueValue.toString();
-                    // Check if the unique field value exceeds 512 bytes
-                    if (uniqueId.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 512) {
-                        log.debug("Using 'unique' field from document as document ID: {}", uniqueId);
-                        return uniqueId;
+                    // Construct Struct format for consistency
+                    String structFormatId = "Struct{fullDocument.unique=" + uniqueId + "}";
+                    // Check if the Struct format exceeds 512 bytes
+                    if (structFormatId.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 512) {
+                        log.debug("Using Struct format with 'unique' field from document as document ID: {}", structFormatId);
+                        return structFormatId;
                     } else {
-                        log.warn("'unique' field exceeds 512 bytes ({} bytes), generating hash-based ID instead", 
-                                uniqueId.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+                        log.warn("Struct format exceeds 512 bytes ({} bytes), generating hash-based ID instead", 
+                                structFormatId.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
                         // Generate hash of the unique field value
                         java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
                         byte[] hash = digest.digest(uniqueId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
