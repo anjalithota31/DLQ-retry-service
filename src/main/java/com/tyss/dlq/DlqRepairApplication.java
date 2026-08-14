@@ -592,16 +592,17 @@ public class DlqRepairApplication {
             java.util.regex.Pattern structPattern = java.util.regex.Pattern.compile("Struct\\{.*?fullDocument\\.unique=([^}]+)\\}");
             java.util.regex.Matcher structMatcher = structPattern.matcher(keyStr);
             if (structMatcher.find()) {
-                // Return the full Struct format instead of just the unique value
-                if (keyStr.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 512) {
-                    log.info("Using full Struct key as document ID: {}", keyStr);
-                    return keyStr;
+                // Extract only the unique value from Struct key to avoid duplicates
+                String uniqueValue = structMatcher.group(1);
+                if (uniqueValue.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 512) {
+                    log.info("Using unique value from Struct key as document ID: {}", uniqueValue);
+                    return uniqueValue;
                 } else {
-                    log.warn("Struct key exceeds 512 bytes ({} bytes), generating hash-based ID instead",
-                            keyStr.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+                    log.warn("Unique value exceeds 512 bytes ({} bytes), generating hash-based ID instead",
+                            uniqueValue.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
                     try {
                         java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
-                        byte[] hash = digest.digest(keyStr.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                        byte[] hash = digest.digest(uniqueValue.getBytes(java.nio.charset.StandardCharsets.UTF_8));
                         StringBuilder hexString = new StringBuilder();
                         for (byte b : hash) {
                             String hex = Integer.toHexString(0xff & b);
@@ -760,6 +761,7 @@ public class DlqRepairApplication {
         List<ElasticsearchIndexer.BulkEntry> targetBatch = new ArrayList<>();
         List<ElasticsearchIndexer.FailureEntry> failureBatch = new ArrayList<>();
         Map<String, PendingRecord> pendingById = new LinkedHashMap<>();
+        List<ParseFailureRecord> parseFailureRecords = new ArrayList<>();
         int parseFailureCount = 0;
         
         // Phase 1: Repair all records in-memory
@@ -814,6 +816,16 @@ public class DlqRepairApplication {
                         recordValuePreview, e.getClass().getSimpleName(), e.getMessage(), e);
                 
                 storeParseFailure(record, e, indexer, failedIndex, targetIndex, mapper);
+                
+                // Capture parse failure for status tracking
+                String esId = toEsId(record.key(), record.value());
+                String errorType = e.getClass().getSimpleName();
+                String errorMessage = e.getMessage();
+                String detailedError = String.format("%s: %s", errorType, 
+                    errorMessage != null ? errorMessage : "No error message provided");
+                
+                parseFailureRecords.add(new ParseFailureRecord(
+                    esId, record, targetIndex, detailedError, record.value()));
             }
         }
         
@@ -836,6 +848,24 @@ public class DlqRepairApplication {
         
         // Log circuit breaker state before status tracking
         log.info("Phase 3: Circuit breaker state before status tracking: {}", circuitBreaker.getState());
+        
+        // Add parse failures to status tracking
+        for (ParseFailureRecord parseFailure : parseFailureRecords) {
+            FailedDocument statusDoc = new FailedDocument(
+                parseFailure.targetIndex,
+                parseFailure.esId,
+                parseFailure.detailedError,
+                null, // problematicFields
+                null, // repairedFields
+                null, // removedFields
+                parseFailure.detailedError, // esErrorDetails
+                parseFailure.originalValue, // originalDocument
+                "FAILED" // status
+            );
+            
+            allDocumentsStatusBatch.add(new ElasticsearchIndexer.FailureEntry(
+                parseFailure.esId, mapper.convertValue(statusDoc, Map.class)));
+        }
         
         for (ElasticsearchIndexer.BulkEntry entry : targetBatch) {
             PendingRecord pending = pendingById.get(entry.id);
@@ -894,7 +924,8 @@ public class DlqRepairApplication {
                 entry.id, mapper.convertValue(statusDoc, Map.class)));
         }
         
-        log.info("Phase 3: Total documents to track in dlq-documents-status: {}", allDocumentsStatusBatch.size());
+        log.info("Phase 3: Total documents to track in dlq-documents-status: {} (including {} parse failures)", 
+                allDocumentsStatusBatch.size(), parseFailureRecords.size());
         if (!allDocumentsStatusBatch.isEmpty()) {
             List<String> failedStatusDocs = indexer.bulkIndexFailures(failedIndex, allDocumentsStatusBatch);
             if (failedStatusDocs.isEmpty()) {
@@ -1159,6 +1190,22 @@ public class DlqRepairApplication {
             this.record       = record;
             this.repairResult = repairResult;
             this.targetDoc    = targetDoc;
+        }
+    }
+
+    private static class ParseFailureRecord {
+        final String esId;
+        final ConsumerRecord<String, String> record;
+        final String targetIndex;
+        final String detailedError;
+        final String originalValue;
+
+        ParseFailureRecord(String esId, ConsumerRecord<String, String> record, String targetIndex, String detailedError, String originalValue) {
+            this.esId = esId;
+            this.record = record;
+            this.targetIndex = targetIndex;
+            this.detailedError = detailedError;
+            this.originalValue = originalValue;
         }
     }
 
