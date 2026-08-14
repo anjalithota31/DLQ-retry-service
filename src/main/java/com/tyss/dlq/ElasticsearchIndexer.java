@@ -80,6 +80,8 @@ public class ElasticsearchIndexer {
         List<String> failed = new ArrayList<>();
         if (entries.isEmpty()) return failed;
 
+        log.info("Starting bulk index failures for index '{}'. Total entries: {}", index, entries.size());
+
         List<BulkOperation> bulkOperations = new ArrayList<>();
         for (FailureEntry e : entries) {
             try {
@@ -107,6 +109,9 @@ public class ElasticsearchIndexer {
                 BulkResponse response = client.bulk(b -> b.operations(currentBulkOperations));
                 List<String> attemptFailed = new ArrayList<>();
 
+                log.info("Bulk failure index attempt {}/{}. Total operations: {}, Errors: {}", 
+                        attempt + 1, maxRetries + 1, currentBulkOperations.size(), response.errors());
+
                 if (response.errors()) {
                     final int attemptFinal=attempt;
                     response.items().forEach(item -> {
@@ -125,7 +130,7 @@ public class ElasticsearchIndexer {
                 }
 
                 if (attemptFailed.isEmpty()) {
-                    log.debug("Bulk indexed {} failure docs into '{}'. failures={}", entries.size(), index, failed.size());
+                    log.info("Bulk indexed {} failure docs into '{}'. Total failures: {}", entries.size(), index, failed.size());
                     return failed;
                 }
 

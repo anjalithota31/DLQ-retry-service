@@ -847,6 +847,8 @@ public class DlqRepairApplication {
         
         // Log circuit breaker state before status tracking
         log.info("Phase 3: Circuit breaker state before status tracking: {}", circuitBreaker.getState());
+        log.info("Phase 3: Starting status tracking. Total input records: {}, Target batch: {}, Parse failures: {}", 
+                records.size(), targetBatch.size(), parseFailureRecords.size());
         
         // Add parse failures to status tracking
         for (ParseFailureRecord parseFailure : parseFailureRecords) {
@@ -866,10 +868,19 @@ public class DlqRepairApplication {
                 parseFailure.esId, mapper.convertValue(statusDoc, Map.class)));
         }
         
+        log.info("Phase 3: Added {} parse failures to status tracking", parseFailureRecords.size());
+        
+        int processedCount = 0;
+        int skippedCount = 0;
         for (ElasticsearchIndexer.BulkEntry entry : targetBatch) {
             PendingRecord pending = pendingById.get(entry.id);
-            if (pending == null) continue;
+            if (pending == null) {
+                skippedCount++;
+                log.warn("Phase 3: Pending record not found for entry id={}, skipping", entry.id);
+                continue;
+            }
             
+            processedCount++;
             String status = failedSet.contains(entry.id) ? "FAILED" : "SUCCESS";
             String failureReason = failedSet.contains(entry.id) ? failedIdsWithReasons.get(entry.id) : null;
             
@@ -923,8 +934,12 @@ public class DlqRepairApplication {
                 entry.id, mapper.convertValue(statusDoc, Map.class)));
         }
         
+        log.info("Phase 3: Processed {} documents from target batch, skipped {} (pending not found)", 
+                processedCount, skippedCount);
         log.info("Phase 3: Total documents to track in dlq-documents-status: {} (including {} parse failures)", 
                 allDocumentsStatusBatch.size(), parseFailureRecords.size());
+        log.info("Phase 3: Expected total: {} (input records), Actual total: {} (status batch), Difference: {}", 
+                records.size(), allDocumentsStatusBatch.size(), records.size() - allDocumentsStatusBatch.size());
         if (!allDocumentsStatusBatch.isEmpty()) {
             List<String> failedStatusDocs = indexer.bulkIndexFailures(failedIndex, allDocumentsStatusBatch);
             if (failedStatusDocs.isEmpty()) {
