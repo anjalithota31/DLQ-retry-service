@@ -290,8 +290,9 @@ public class DlqRepairApplication {
         System.out.println("Final Assignment : " + consumer.assignment());
         log.info("Assigned partitions: {}", consumer.assignment());
 
-// Force consumer to start from beginning to reprocess all DLQ messages
-consumer.seekToBeginning(consumer.assignment());
+        // Note: Consumer will resume from last committed offset if available.
+        // For new consumer groups, auto.offset.reset=earliest ensures starting from beginning.
+        // To force reprocessing of all messages, reset consumer group offsets externally.
 
         // Initialize thread pool for concurrent processing
         ExecutorService threadPool = new ThreadPoolExecutor(
@@ -347,12 +348,30 @@ consumer.seekToBeginning(consumer.assignment());
                     circuitBreaker.getState(), circuitBreaker.getFailureCount(), mappingCache.getStats(), metrics.getMetricsSummary()));
 
             // ----------------------------------------------------------------
+            // Log consumer position and lag for monitoring
+            // ----------------------------------------------------------------
+            try {
+                Map<org.apache.kafka.common.TopicPartition, Long> endOffsets = consumer.endOffsets(consumer.assignment());
+                long totalLag = 0;
+                for (Map.Entry<org.apache.kafka.common.TopicPartition, Long> entry : endOffsets.entrySet()) {
+                    long currentOffset = consumer.position(entry.getKey());
+                    long lag = entry.getValue() - currentOffset;
+                    totalLag += lag;
+                }
+                if (totalLag > 0) {
+                    log.info("Consumer lag: {} messages remaining to process", totalLag);
+                }
+            } catch (Exception e) {
+                log.debug("Could not calculate consumer lag: {}", e.getMessage());
+            }
+
+            // ----------------------------------------------------------------
             // Poll
             // ----------------------------------------------------------------
             ConsumerRecords<String, String> records = consumer.poll(Duration.ofSeconds(2));
             log.info("Polled {} records", records.count());
             if (records.isEmpty()) {
-                log.info("No records available");
+                log.info("No records available - waiting for new messages");
                 continue;
             }
 
